@@ -45,6 +45,10 @@ static const XLogSmgr tde_xlog_smgr = {
 
 static void *EncryptionCryptCtx = NULL;
 
+static uint8 *EncryptedBlocksMap = NULL;
+static int BlocksInSeg = 0;
+static XLogSegNo EncryptedCurrSegno = 0;
+
 /* TODO: can be swapped out to the disk */
 static WalEncryptionRange CurrentWalEncryptionRange = {
 	.type = WAL_ENCRYPTION_RANGE_INVALID,
@@ -75,6 +79,8 @@ typedef struct EncryptionStateData
 	 */
 	pg_atomic_uint32 enc_key_tli;
 	pg_atomic_uint64 enc_key_lsn;
+
+	uint64 enc_call_cnt;
 } EncryptionStateData;
 
 static EncryptionStateData *EncryptionState = NULL;
@@ -108,6 +114,7 @@ TDEXLogSetEncKeyLocation(WalLocation loc)
 }
 
 static Size TDEXLogEncryptBuffSize(void);
+static Size TDEXLogEncryptedWalBlocksSize(void);
 
 static int	XLOGChooseNumBuffers(void);
 
@@ -131,9 +138,22 @@ static Size
 TDEXLogEncryptBuffSize(void)
 {
 	int			xbuffers;
+	Size		min_buf;
 
 	xbuffers = (XLOGbuffers == -1) ? XLOGChooseNumBuffers() : XLOGbuffers;
-	return Max(MAX_SEND_SIZE, mul_size(XLOG_BLCKSZ, xbuffers));
+	min_buf = Max(MAX_SEND_SIZE, mul_size(XLOG_BLCKSZ, xbuffers));
+
+	/*
+	 * Backend encrypted writes use EncryptionBuf as output buffer and can span
+	 * any part of a WAL segment, so keep room for a full segment.
+	 */
+	return Max((Size) wal_segment_size, min_buf);
+}
+
+static Size
+TDEXLogEncryptedWalBlocksSize(void)
+{
+	return (Size) (wal_segment_size / XLOG_BLCKSZ);
 }
 
 Size
@@ -143,6 +163,7 @@ TDEXLogSmgrShmemSize(void)
 
 	sz = sizeof(EncryptionStateData);
 	sz = add_size(sz, TDEXLogEncryptBuffSize());
+	sz = add_size(sz, TDEXLogEncryptedWalBlocksSize());
 	sz = add_size(sz, PG_IO_ALIGN_SIZE);
 
 	return sz;
@@ -180,8 +201,12 @@ TDEXLogSmgrShmemInit(void)
 	}
 
 	EncryptionBuf = (char *) TYPEALIGN(PG_IO_ALIGN_SIZE, ((char *) EncryptionState) + sizeof(EncryptionStateData));
+	EncryptedBlocksMap = (uint8 *) EncryptionBuf + TDEXLogEncryptBuffSize();
+	BlocksInSeg = wal_segment_size / XLOG_BLCKSZ;
+	memset(EncryptedBlocksMap, 0, TDEXLogEncryptedWalBlocksSize());
 
-	Assert((char *) EncryptionState + TDEXLogSmgrShmemSize() >= (char *) EncryptionBuf + TDEXLogEncryptBuffSize());
+	Assert((char *) EncryptionState + TDEXLogSmgrShmemSize() >=
+			   (char *) EncryptionBuf + TDEXLogEncryptBuffSize() + TDEXLogEncryptedWalBlocksSize());
 }
 
 #else							/* !FRONTEND */
@@ -190,6 +215,8 @@ typedef struct EncryptionStateData
 {
 	TimeLineID	enc_key_tli;
 	XLogRecPtr	enc_key_lsn;
+
+	uint64 enc_call_cnt;
 } EncryptionStateData;
 
 static EncryptionStateData EncryptionStateD = {0};
@@ -352,9 +379,6 @@ TDEXLogWriteEncryptedPagesOldKeys(int fd, const void *buf, size_t count, off_t o
 	return pg_pwrite(fd, enc_buff, count, offset);
 }
 
-/*
- * Encrypt XLog page(s) from the buf and write to the segment file.
- */
 static ssize_t
 TDEXLogWriteEncryptedPages(int fd, const void *buf, size_t count, off_t offset,
 						   TimeLineID tli, XLogSegNo segno)
@@ -362,10 +386,6 @@ TDEXLogWriteEncryptedPages(int fd, const void *buf, size_t count, off_t offset,
 	char		iv_prefix[16];
 	WalEncryptionRange *range = &CurrentWalEncryptionRange;
 	char	   *enc_buff = EncryptionBuf;
-
-#ifndef FRONTEND
-	Assert(count <= TDEXLogEncryptBuffSize());
-#endif
 
 #ifdef TDE_XLOG_DEBUG
 	elog(DEBUG1, "write encrypted WAL, size: %lu, offset: %ld [%lX], seg: %X/%X, key_start_lsn: %u_%X/%X",
@@ -382,6 +402,98 @@ TDEXLogWriteEncryptedPages(int fd, const void *buf, size_t count, off_t offset,
 						range->key.key,
 						range->key.key_len,
 						&EncryptionCryptCtx);
+
+	// elog(INFO, "pg_tde_stream_crypt calls %lu", ++EncryptionState->enc_call_cnt);
+
+	return pg_pwrite(fd, enc_buff, count, offset);
+}
+
+/*
+ * Encrypt XLog page(s) from the buf and write to the segment file.
+ */
+static ssize_t
+TDEXLogWriteEncryptedPages2(int fd, const void *buf, size_t count, off_t offset,
+						   TimeLineID tli, XLogSegNo segno)
+{
+	int			first_block;
+	int			nblocks;
+	int			run_start = -1;
+	char		iv_prefix[16];
+	WalEncryptionRange *range = &CurrentWalEncryptionRange;
+	char	   *enc_buff;
+
+#ifndef FRONTEND
+	Assert(count <= TDEXLogEncryptBuffSize());
+	Assert((Size) offset + count <= TDEXLogEncryptBuffSize());
+#endif
+	Assert(count % XLOG_BLCKSZ == 0);
+	Assert(BlocksInSeg > 0);
+	enc_buff = EncryptionBuf + offset;
+
+	if (EncryptedCurrSegno != segno)
+	{
+		memset(EncryptedBlocksMap, 0, (Size) BlocksInSeg);
+		EncryptedCurrSegno = segno;
+	}
+
+	first_block = offset / XLOG_BLCKSZ;
+	nblocks = count / XLOG_BLCKSZ;
+
+#ifdef TDE_XLOG_DEBUG
+	elog(INFO, "write encrypted WAL, size: %lu, offset: %ld [%lX], seg: %X/%X, key_start_lsn: %u_%X/%X",
+		 count, offset, offset, LSN_FORMAT_ARGS(segno), range->start.tli, LSN_FORMAT_ARGS(range->start.lsn));
+#endif
+
+	CalcXLogPageIVPrefix(tli, segno, range->key.base_iv, iv_prefix);
+
+	for (int i = 0; i < nblocks; i++)
+	{
+		int			blockno = first_block + i;
+
+		Assert(blockno >= 0 && blockno < BlocksInSeg);
+
+		if (EncryptedBlocksMap[blockno] == 0)
+		{
+			if (run_start < 0)
+				run_start = i;
+
+			EncryptedBlocksMap[blockno] = 1;
+		}
+		else if (run_start >= 0)
+		{
+			off_t		run_off = offset + ((off_t) run_start * XLOG_BLCKSZ);
+			size_t		run_sz = (size_t) (i - run_start) * XLOG_BLCKSZ;
+
+			pg_tde_stream_crypt(iv_prefix,
+							run_off,
+							(char *) buf + ((size_t) run_start * XLOG_BLCKSZ),
+							run_sz,
+							enc_buff + ((size_t) run_start * XLOG_BLCKSZ),
+							range->key.key,
+							range->key.key_len,
+							&EncryptionCryptCtx);
+			run_start = -1;
+
+			// elog(INFO, "pg_tde_stream_crypt calls %lu", ++EncryptionState->enc_call_cnt);
+		}
+	}
+
+	if (run_start >= 0)
+	{
+		off_t		run_off = offset + ((off_t) run_start * XLOG_BLCKSZ);
+		size_t		run_sz = (size_t) (nblocks - run_start) * XLOG_BLCKSZ;
+
+		pg_tde_stream_crypt(iv_prefix,
+							run_off,
+							(char *) buf + ((size_t) run_start * XLOG_BLCKSZ),
+							run_sz,
+							enc_buff + ((size_t) run_start * XLOG_BLCKSZ),
+							range->key.key,
+							range->key.key_len,
+							&EncryptionCryptCtx);
+
+		// elog(INFO, "pg_tde_stream_crypt calls %lu", ++EncryptionState->enc_call_cnt);
+	}
 
 	return pg_pwrite(fd, enc_buff, count, offset);
 }
@@ -444,7 +556,7 @@ tdeheap_xlog_seg_write(int fd, const void *buf, size_t count, off_t offset,
 	}
 	else if (CurrentWalEncryptionRange.type == WAL_ENCRYPTION_RANGE_ENCRYPTED)
 	{
-		return TDEXLogWriteEncryptedPages(fd, buf, count, offset, tli, segno);
+		return TDEXLogWriteEncryptedPages2(fd, buf, count, offset, tli, segno);
 	}
 	else
 	{
