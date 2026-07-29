@@ -226,16 +226,16 @@ main(int argc, char *argv[])
 
 		{
 			char		tdedir[MAXPGPATH];
-			char		abssourcepath[MAXPGPATH];
-			char	   *resolved_sourcepath;
+			char	   *abssourcepath;
 
 			derive_tde_dir_from_segment_path(sourcepath, sep, tdedir, sizeof(tdedir));
-			resolved_sourcepath = realpath(sourcepath, abssourcepath);
-
+			abssourcepath = realpath(sourcepath, NULL);
 			pg_log_info("pg_tde dir: %s, sourcepath: %s, sourcepath(abs): %s",
 						tdedir,
 						sourcepath,
-						resolved_sourcepath != NULL ? resolved_sourcepath : sourcepath);
+						abssourcepath != NULL ? abssourcepath : sourcepath);
+			pfree(abssourcepath);
+
 			pg_tde_fe_init(tdedir);
 			TDEXLogSmgrInit();
 		}
