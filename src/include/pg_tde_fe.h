@@ -7,6 +7,7 @@
 
 #ifdef FRONTEND
 
+#include <dirent.h>
 #include <stdarg.h>
 
 #include "postgres_fe.h"
@@ -132,6 +133,9 @@ tde_fe_errhint(const char *fmt, ...)
 
 #define OpenTransientFile(fileName, fileFlags) open(fileName, fileFlags, PG_FILE_MODE_OWNER)
 #define CloseTransientFile(fd) close(fd)
+#define AllocateDir(dirname) opendir(dirname)
+#define ReadDirExtended(dir, dirname, elevel) readdir(dir)
+#define FreeDir(dir) closedir(dir)
 #define AllocateFile(name, mode) fopen(name, mode)
 #define FreeFile(file) fclose(file)
 
