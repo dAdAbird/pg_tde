@@ -86,6 +86,7 @@ static dshash_parameters principal_key_dsh_params = {
 static TdePrincipalKeylocalState principalKeyLocalState;
 
 static void principal_key_info_attach_shmem(void);
+static void clear_principal_key_cache(Oid databaseId);
 static inline dshash_table *get_principal_key_hash(void);
 static TDEPrincipalKey *get_principal_key_from_cache(Oid dbOid);
 static bool pg_tde_is_same_principal_key(TDEPrincipalKey *a, TDEPrincipalKey *b);
@@ -454,7 +455,7 @@ principal_key_startup_cleanup(Oid databaseId)
 	pg_tde_delete_tde_files(databaseId);
 }
 
-void
+static void
 clear_principal_key_cache(Oid databaseId)
 {
 	TDEPrincipalKey *cache_entry;

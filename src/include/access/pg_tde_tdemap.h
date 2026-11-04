@@ -14,14 +14,13 @@ extern void pg_tde_delete_rel_key(RelFileLocator rel);
 extern int	pg_tde_count_encryption_keys(Oid dbOid, Oid spcOid);
 
 extern void pg_tde_delete_tde_files(Oid dbOid);
-extern void pg_tde_ensure_delete_on_start(void);
+extern void pg_tde_ensure_key_dirs_on_start(void);
 
 extern TDESignedPrincipalKeyInfo *pg_tde_get_principal_key_info(Oid dbOid);
 extern bool pg_tde_verify_principal_key_info(TDESignedPrincipalKeyInfo *signed_key_info, const KeyData *principal_key_data);
 extern void pg_tde_save_principal_key(const TDEPrincipalKey *principal_key, bool write_xlog);
 extern void pg_tde_save_principal_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info);
 extern void pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincipalKey *new_principal_key, bool write_xlog);
-extern void pg_tde_ensure_rotation_on_start(void);
 extern void pg_tde_delete_principal_key(Oid dbOid);
 extern void pg_tde_delete_principal_key_redo(Oid dbOid);
 

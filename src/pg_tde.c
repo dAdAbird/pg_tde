@@ -92,8 +92,7 @@ tde_shmem_startup(void)
 
 	TDEXLogSmgrInit();
 	pg_tde_migrate_internal_keys();
-	pg_tde_ensure_delete_on_start();
-	pg_tde_ensure_rotation_on_start();
+	pg_tde_ensure_key_dirs_on_start();
 	TDEXLogSmgrInitWrite(EncryptXLog, KeyLength);
 
 	LWLockRelease(AddinShmemInitLock);
