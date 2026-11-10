@@ -42,6 +42,7 @@
 #define PG_TDE_PRINCIPAL_KEY_FILE	"pkey_info"
 #define PG_TDE_KEY_FILE_SUFFIX		"_key"
 #define PG_TDE_KEY_FILENAME			"%u_%u" PG_TDE_KEY_FILE_SUFFIX
+#define PG_TDE_TMP_FILE_SUFFIX		".r"
 
 #define PG_TDE_DB_DIR_DELETE_SUFFIX	".rm"
 #define PG_TDE_GEN_DIR_NEW_SUFFIX	".new"
@@ -307,7 +308,7 @@ pg_tde_durable_write_file(const char *path, const void *data, size_t len)
 {
 	char		path_tmp[MAXPGPATH];
 
-	snprintf(path_tmp, MAXPGPATH, "%s.r", path);
+	snprintf(path_tmp, MAXPGPATH, "%s" PG_TDE_TMP_FILE_SUFFIX, path);
 
 	pg_tde_write_file(path_tmp, data, len);
 
@@ -721,6 +722,9 @@ pg_tde_save_principal_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 {
 	Oid			dbOid = principal_key->keyInfo.databaseId;
 	TDESignedPrincipalKeyInfo signed_key_info;
+	char		new_dir[MAXPGPATH];
+	uint32		gen;
+	XLogRecPtr	lsn;
 
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 
@@ -736,14 +740,42 @@ pg_tde_save_principal_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 
 	pg_tde_sign_principal_key_info(&signed_key_info, principal_key);
 
-	if (write_xlog)
+	if (!write_xlog)
 	{
-		XLogBeginInsert();
-		XLogRegisterData((char *) &signed_key_info, sizeof(TDESignedPrincipalKeyInfo));
-		XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ADD_PRINCIPAL_KEY);
+		pg_tde_save_signed_principal_key(&signed_key_info);
+		return;
 	}
 
-	pg_tde_save_signed_principal_key(&signed_key_info);
+	/* Everything that may fail is done before the record is written */
+	gen = pg_tde_start_key_gen(&signed_key_info, new_dir);
+	pg_tde_sync_new_key_gen(dbOid, new_dir);
+
+	/* Assigning an xid may fail, so it can't be done in the critical section */
+	GetTopTransactionId();
+
+	/*
+	 * Once the WAL record is written, the key must be saved, as replicas and
+	 * the crash recovery will do it anyway. So any failure after is a PANIC.
+	 * Also, the checkpoint must not complete between the record and the key
+	 * being saved, otherwise the crash recovery won't replay the record.
+	 */
+	START_CRIT_SECTION();
+
+	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &signed_key_info, sizeof(TDESignedPrincipalKeyInfo));
+	lsn = XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ADD_PRINCIPAL_KEY);
+	XLogFlush(lsn);
+
+	pg_tde_publish_key_gen(dbOid, gen, new_dir);
+
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+
+	END_CRIT_SECTION();
+
+	pg_tde_remove_old_key_gens(dbOid, gen - 1);
 }
 
 /*
