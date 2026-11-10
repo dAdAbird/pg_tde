@@ -20,7 +20,10 @@
 #ifdef FRONTEND
 #include "pg_tde_fe.h"
 #else
+#include "access/xact.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #endif
 
 /* A useful macro when debugging key encryption/decryption */
@@ -137,7 +140,6 @@ static bool pg_tde_parse_key_file_name(const char *name, Oid *spcOid, RelFileNum
 static List *pg_tde_list_key_files(Oid dbOid, uint32 gen, Oid spcOid);
 static void pg_tde_remove_dir_if_exists(const char *path);
 static bool pg_tde_is_current_principal_key(Oid dbOid, const TDEPrincipalKey *principal_key);
-static void pg_tde_finish_rotation_on_start(Oid dbOid);
 #endif
 
 static void
@@ -444,7 +446,8 @@ pg_tde_sync_new_key_gen(Oid dbOid, const char *new_dir)
 /*
  * Gives the key generation built in new_dir its number, which makes it the
  * current one. It is a single rename, so the generation appears with all its
- * files at once.
+ * files at once. Everything that may fail for a reason other than I/O is done
+ * by this time, hence it fits a critical section.
  */
 static void
 pg_tde_publish_key_gen(Oid dbOid, uint32 gen, const char *new_dir)
@@ -628,65 +631,16 @@ pg_tde_is_current_principal_key(Oid dbOid, const TDEPrincipalKey *principal_key)
 }
 
 /*
- * Finishes the rotation of the principal key that was interrupted while the
- * next key generation was being built. It is done again, as the WAL record of
- * the rotation may be already sent to replicas.
- */
-static void
-pg_tde_finish_rotation_on_start(Oid dbOid)
-{
-	char		new_dir[MAXPGPATH];
-	char		new_pkey_path[MAXPGPATH];
-	TDESignedPrincipalKeyInfo *new_key_info;
-	TDESignedPrincipalKeyInfo *old_key_info;
-	TDEPrincipalKey *principal_key;
-	TDEPrincipalKey *new_principal_key;
-
-	pg_tde_set_gen_dir_path(dbOid, pg_tde_get_key_gen(dbOid, ERROR) + 1,
-							PG_TDE_GEN_DIR_NEW_SUFFIX, new_dir);
-	snprintf(new_pkey_path, MAXPGPATH, "%s/" PG_TDE_PRINCIPAL_KEY_FILE, new_dir);
-
-	new_key_info = pg_tde_read_principal_key_file(new_pkey_path);
-	old_key_info = pg_tde_get_principal_key_info(dbOid);
-
-	/* No generation was being built, or it was not a rotation */
-	if (new_key_info == NULL || old_key_info == NULL)
-	{
-		if (new_key_info)
-			pfree(new_key_info);
-		if (old_key_info)
-			pfree(old_key_info);
-		return;
-	}
-
-	ereport(LOG,
-			errmsg("finishing interrupted principal key rotation for database %u", dbOid));
-
-	principal_key = pg_tde_load_principal_key(old_key_info);
-	new_principal_key = pg_tde_load_principal_key(new_key_info);
-
-	/* The WAL record has been written already */
-	pg_tde_perform_rotate_key(principal_key, new_principal_key, false);
-
-	pfree(new_key_info);
-	pfree(old_key_info);
-	pfree(principal_key);
-	pfree(new_principal_key);
-}
-
-/*
- * Brings the key directories to a consistent state after a crash in the
- * middle of a rotation or a deletion and removes leftovers:
+ * Removes the key generations that are not needed anymore: all but the
+ * current one of every database, and whatever is left of the ones that were
+ * never published.
  *
- *	<dbOid>.rm			- removed, the deletion was interrupted.
- *	<dbOid>/<gen>.new	- the rotation hasn't finished building the next key
- *						  generation. It is done again, as its WAL record may
- *						  be already sent to replicas.
- *	<dbOid>/<gen>		- removed unless it is the current generation. The
- *						  previous one is kept after a change of the principal
- *						  key for the sake of those who copy the key files
- *						  while the server is running. Nobody does when it
- *						  starts, so this is the time to get rid of it.
+ * The previous generation is kept after a change of the principal key for the
+ * sake of those who copy the key files while the server is running. Nobody
+ * does when it starts, so this is the time to get rid of them.
+ *
+ * Nothing has to be fixed here for redo: a generation that was not published
+ * before a crash is built again by redo of its WAL record.
  *
  * Should be called on server start.
  */
@@ -697,8 +651,6 @@ pg_tde_ensure_key_dirs_on_start(void)
 	DIR		   *dir;
 	struct dirent *de;
 	List	   *db_oids = NIL;
-	List	   *rm_dirs = NIL;
-	const size_t suffix_len = strlen(PG_TDE_DB_DIR_DELETE_SUFFIX);
 
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
 
@@ -716,36 +668,21 @@ pg_tde_ensure_key_dirs_on_start(void)
 
 	while ((de = ReadDir(dir, data_dir)) != NULL)
 	{
-		size_t		len = strlen(de->d_name);
 		Oid			dbOid;
 
 		/* The directory of a database is named with its oid, as a generation */
 		if (pg_tde_parse_gen_dir_name(de->d_name, &dbOid))
 			db_oids = lappend_oid(db_oids, dbOid);
-		else if (len > suffix_len &&
-				 strcmp(de->d_name + len - suffix_len, PG_TDE_DB_DIR_DELETE_SUFFIX) == 0)
-			rm_dirs = lappend(rm_dirs, psprintf("%s/%s", data_dir, de->d_name));
 	}
 
 	FreeDir(dir);
 
-	foreach_ptr(char, path, rm_dirs)
-	{
-		ereport(LOG,
-				errmsg("removing keys left by an interrupted deletion in \"%s\"", path));
-		pg_tde_remove_dir_if_exists(path);
-	}
-
 	foreach_oid(dbOid, db_oids)
-	{
-		pg_tde_finish_rotation_on_start(dbOid);
 		pg_tde_remove_old_key_gens(dbOid, pg_tde_get_key_gen(dbOid, ERROR));
-	}
 
 	LWLockRelease(tde_lwlock_enc_keys());
 
 	list_free(db_oids);
-	list_free_deep(rm_dirs);
 }
 
 /*
@@ -905,32 +842,10 @@ pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincip
 
 	/*
 	 * When replaying, there is nothing to do if the database already uses the
-	 * new key. E.g. the rotation was finished on start and now its WAL record
-	 * is replayed.
+	 * new key, i.e. its generation was published before the crash.
 	 */
 	if (!write_xlog && pg_tde_is_current_principal_key(dbOid, new_principal_key))
 		return;
-
-	/* Log the rotation before starting it (if needed) */
-	/* TODO: should be XLogFlush'd */
-	if (write_xlog)
-	{
-		XLogPrincipalKeyRotate xlrec;
-
-		xlrec.databaseId = new_principal_key->keyInfo.databaseId;
-		xlrec.keyringId = new_principal_key->keyInfo.keyringId;
-		memcpy(xlrec.keyName, new_principal_key->keyInfo.name, sizeof(new_principal_key->keyInfo.name));
-
-		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(XLogPrincipalKeyRotate));
-		XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ROTATE_PRINCIPAL_KEY);
-	}
-
-	/*
-	 * ??? Can a checkpoint happen here? And if a crash too...
-	 * So on redo, no pg_tde_finish_rotation_on_start, hence replicas have rotated keys
-	 * but primary hasn't.
-	 */
 
 	pg_tde_sign_principal_key_info(&signed_key_info, new_principal_key);
 
@@ -955,7 +870,38 @@ pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincip
 
 	pg_tde_sync_new_key_gen(dbOid, new_dir);
 
+	if (write_xlog)
+	{
+		XLogPrincipalKeyRotate xlrec;
+		XLogRecPtr	lsn;
+
+		/* Assigning an xid may fail, hence should be out of the critical section */
+		GetTopTransactionId();
+
+		START_CRIT_SECTION();
+
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+
+		xlrec.databaseId = new_principal_key->keyInfo.databaseId;
+		xlrec.keyringId = new_principal_key->keyInfo.keyringId;
+		memcpy(xlrec.keyName, new_principal_key->keyInfo.name, sizeof(new_principal_key->keyInfo.name));
+
+		XLogBeginInsert();
+		XLogRegisterData((char *) &xlrec, sizeof(XLogPrincipalKeyRotate));
+		lsn = XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ROTATE_PRINCIPAL_KEY);
+
+		XLogFlush(lsn);
+	}
+
 	pg_tde_publish_key_gen(dbOid, new_gen, new_dir);
+
+	if (write_xlog)
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+
+		END_CRIT_SECTION();
+	}
 
 	/* Keeps the generation we have just replaced */
 	pg_tde_remove_old_key_gens(dbOid, old_gen);
