@@ -43,6 +43,9 @@ extern Size PrincipalKeyShmemSize(void);
 #ifndef FRONTEND
 extern void principal_key_startup_cleanup(Oid databaseId);
 extern LWLock *tde_lwlock_enc_keys(void);
+extern LWLock *tde_lwlock_wal_keys(void);
+extern bool pg_tde_get_server_key_copy(TDEPrincipalKey *key);
+extern void pg_tde_set_server_key_cache(const TDEPrincipalKey *key);
 extern bool pg_tde_principal_key_configured(Oid databaseId);
 extern TDEPrincipalKey *GetPrincipalKey(Oid dbOid, LWLockMode lockMode);
 #else

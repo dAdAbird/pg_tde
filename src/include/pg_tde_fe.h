@@ -130,6 +130,7 @@ tde_fe_errhint(const char *fmt, ...)
 #define LW_SHARED NULL
 #define LW_EXCLUSIVE NULL
 #define tde_lwlock_enc_keys() NULL
+#define tde_lwlock_wal_keys() NULL
 
 #define OpenTransientFile(fileName, fileFlags) open(fileName, fileFlags, PG_FILE_MODE_OWNER)
 #define CloseTransientFile(fd) close(fd)

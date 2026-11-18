@@ -87,10 +87,15 @@ pg_tde_free_wal_key_cache(void)
 	tde_wal_key_last_rec = NULL;
 }
 
+/*
+ * Called by the WAL write callback, possibly with WALWriteLock held. So it
+ * must not take tde_lwlock_enc_keys, see the comments to
+ * tde_lwlock_wal_keys().
+ */
 void
 pg_tde_wal_last_range_set_location(WalLocation loc)
 {
-	LWLock	   *lock_pk = tde_lwlock_enc_keys();
+	LWLock	   *lock_pk = tde_lwlock_wal_keys();
 	int			fd;
 	off_t		read_pos,
 				write_pos,
@@ -185,7 +190,9 @@ pg_tde_create_wal_range(WalEncryptionRange *range, WalEncryptionRangeType type, 
 
 	pg_tde_generate_internal_key(&range->key, key_len);
 
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 	pg_tde_write_wal_key_file_entry(range, principal_key);
+	LWLockRelease(tde_lwlock_wal_keys());
 
 #ifdef FRONTEND
 	free(principal_key);
@@ -229,6 +236,8 @@ pg_tde_read_last_wal_range(void)
 		return NULL;
 	}
 
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_SHARED);
+
 	fd = pg_tde_open_wal_key_file_read(get_wal_key_file_path(), false, &read_pos);
 	fsize = lseek(fd, 0, SEEK_END);
 	/* No keys */
@@ -237,6 +246,7 @@ pg_tde_read_last_wal_range(void)
 #ifdef FRONTEND
 		pfree(principal_key);
 #endif
+		LWLockRelease(tde_lwlock_wal_keys());
 		LWLockRelease(lock_pk);
 		CloseTransientFile(fd);
 		return NULL;
@@ -244,6 +254,8 @@ pg_tde_read_last_wal_range(void)
 
 	file_idx = ((fsize - sizeof(WalKeyFileHeader)) / sizeof(WalKeyFileEntry)) - 1;
 	pg_tde_read_one_wal_key_file_entry2(fd, file_idx, &entry);
+
+	LWLockRelease(tde_lwlock_wal_keys());
 
 	range = pg_tde_wal_range_from_entry(principal_key, &entry);
 #ifdef FRONTEND
@@ -255,19 +267,32 @@ pg_tde_read_last_wal_range(void)
 	return range;
 }
 
-/* Fetches WAL keys from disk and adds them to the WAL cache */
+/*
+ * Fetches WAL keys from disk and adds them to the WAL cache.
+ *
+ * Called by the WAL read and write callbacks, the latter possibly with
+ * WALWriteLock held. So it must not take tde_lwlock_enc_keys, see the comments
+ * to tde_lwlock_wal_keys().
+ */
 WALKeyCacheRec *
 pg_tde_fetch_wal_keys(WalLocation start)
 {
 	off_t		read_pos = 0;
-	LWLock	   *lock_pk = tde_lwlock_enc_keys();
+	LWLock	   *lock_pk = tde_lwlock_wal_keys();
 	TDEPrincipalKey *principal_key;
+#ifndef FRONTEND
+	TDEPrincipalKey server_key;
+#endif
 	int			fd;
 	int			keys_count;
 	WALKeyCacheRec *return_wal_rec = NULL;
 
 	LWLockAcquire(lock_pk, LW_SHARED);
+#ifndef FRONTEND
+	principal_key = pg_tde_get_server_key_copy(&server_key) ? &server_key : NULL;
+#else
 	principal_key = GetPrincipalKey(GLOBAL_DATA_TDE_OID, LW_SHARED);
+#endif
 	if (principal_key == NULL)
 	{
 		LWLockRelease(lock_pk);
@@ -295,8 +320,9 @@ pg_tde_fetch_wal_keys(WalLocation start)
 		wal_rec = pg_tde_add_wal_range_to_cache(&stub_range);
 
 #ifdef FRONTEND
-		/* The backend frees it after copying to the cache. */
 		pfree(principal_key);
+#else
+		explicit_bzero(&server_key, sizeof(server_key));
 #endif
 		LWLockRelease(lock_pk);
 		CloseTransientFile(fd);
@@ -329,6 +355,8 @@ pg_tde_fetch_wal_keys(WalLocation start)
 	}
 #ifdef FRONTEND
 	pfree(principal_key);
+#else
+	explicit_bzero(&server_key, sizeof(server_key));
 #endif
 	LWLockRelease(lock_pk);
 	CloseTransientFile(fd);
@@ -424,7 +452,9 @@ pg_tde_open_wal_key_file_read(const char *filename,
 	off_t		bytes_read = 0;
 
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_SHARED) ||
-		   LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+		   LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE) ||
+		   LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_SHARED) ||
+		   LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_EXCLUSIVE));
 
 	fd = pg_tde_open_wal_key_file_basic(filename, O_RDONLY | PG_BINARY, ignore_missing);
 	if (ignore_missing && fd < 0)
@@ -453,7 +483,7 @@ pg_tde_open_wal_key_file_write(const char *filename,
 	off_t		bytes_written = 0;
 	int			file_flags = O_RDWR | O_CREAT | PG_BINARY | (truncate ? O_TRUNC : 0);
 
-	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_EXCLUSIVE));
 
 	fd = pg_tde_open_wal_key_file_basic(filename, file_flags, false);
 
@@ -700,12 +730,19 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 				new_fd;
 	char		tmp_path[MAXPGPATH];
 
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 	Assert(principal_key);
 	Assert(principal_key->keyInfo.databaseId == GLOBAL_DATA_TDE_OID);
 
 	pg_tde_sign_principal_key_info(&new_signed_key_info, new_principal_key);
 
 	snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
+
+	/*
+	 * Keeps the WAL callbacks away from the file while we are replacing it.
+	 * Must be released before writing WAL.
+	 */
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
 	old_fd = pg_tde_open_wal_key_file_read(get_wal_key_file_path(), false, &old_curr_pos);
 	new_fd = pg_tde_open_wal_key_file_write(tmp_path, &new_signed_key_info, true, &new_curr_pos);
@@ -735,6 +772,15 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 	 * new data.
 	 */
 	durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
+
+	/*
+	 * The cache must be switched to the new key along with the file.
+	 * principal_key may point to the cache entry, so it must not be used
+	 * after this.
+	 */
+	pg_tde_set_server_key_cache(new_principal_key);
+
+	LWLockRelease(tde_lwlock_wal_keys());
 
 	/*
 	 * We do WAL writes past the event ("the write behind logging") rather
@@ -770,10 +816,12 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info)
 	off_t		curr_pos;
 
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
 	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), signed_key_info, false, &curr_pos);
 	CloseTransientFile(fd);
 
+	LWLockRelease(tde_lwlock_wal_keys());
 	LWLockRelease(tde_lwlock_enc_keys());
 }
 #endif
@@ -808,8 +856,10 @@ pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 	}
 #endif
 
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, true, &curr_pos);
 	CloseTransientFile(fd);
+	LWLockRelease(tde_lwlock_wal_keys());
 }
 
 /*
@@ -895,8 +945,11 @@ pg_tde_delete_server_key(void)
 	XLogRegisterData((char *) &dbOid, sizeof(Oid));
 	XLogInsert(RM_TDERMGR_ID, XLOG_TDE_DELETE_PRINCIPAL_KEY);
 
-	/* Remove whole key map file */
+	/* Remove whole key map file, and the key from the cache along with it */
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 	durable_unlink(get_wal_key_file_path(), ERROR);
+	pg_tde_set_server_key_cache(NULL);
+	LWLockRelease(tde_lwlock_wal_keys());
 }
 
 
@@ -1041,6 +1094,8 @@ pg_tde_update_wal_keys_file(void)
 	}
 	pg_tde_sign_principal_key_info(&signed_key_info, principal_key);
 
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+
 	new_fd = pg_tde_open_wal_key_file_write(tmp_wal_key_file_path, &signed_key_info, true, &write_pos);
 
 	while (read_range(old_fd, &read_pos, principal_key, &new_entry))
@@ -1052,6 +1107,7 @@ pg_tde_update_wal_keys_file(void)
 	CloseTransientFile(new_fd);
 	durable_rename(tmp_wal_key_file_path, get_wal_key_file_path(), ERROR);
 
+	LWLockRelease(tde_lwlock_wal_keys());
 	LWLockRelease(lock_pk);
 }
 

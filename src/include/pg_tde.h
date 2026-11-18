@@ -25,6 +25,7 @@ typedef enum
 {
 	TDE_LWLOCK_ENC_KEY,
 	TDE_LWLOCK_PI_FILES,
+	TDE_LWLOCK_WAL_KEYS,
 
 	/* Must be the last entry in the enum */
 	TDE_LWLOCK_COUNT

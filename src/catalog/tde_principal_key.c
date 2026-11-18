@@ -206,6 +206,37 @@ tde_lwlock_enc_keys(void)
 }
 
 /*
+ * Lock to guard the WAL keys file and the cache entry of the server principal
+ * key the file is encrypted with.
+ *
+ * The WAL write callback needs the file and may run with WALWriteLock held.
+ * While anyone holding tde_lwlock_enc_keys may write (and wait for) WAL. So
+ * the callback must never take tde_lwlock_enc_keys, and uses this lock
+ * instead. Rules:
+ *
+ * - It is a leaf lock. Do not insert or flush WAL and do not acquire
+ *   tde_lwlock_enc_keys while holding it. If both locks are needed,
+ *   tde_lwlock_enc_keys must be acquired first.
+ *
+ * - Anything that changes the file must hold it in the exclusive mode.
+ *   Everything but setting the start location of the last range must also hold
+ *   an exclusive tde_lwlock_enc_keys. Hence, the file header and the number of
+ *   entries can be read with any of the two locks, the entries need this one.
+ *
+ * - The server key changes in the file and in the principal key cache under
+ *   the same exclusive lock, see pg_tde_set_server_key_cache(). So the reader
+ *   of the file always gets the principal key the file is encrypted with from
+ *   pg_tde_get_server_key_copy().
+ */
+LWLock *
+tde_lwlock_wal_keys(void)
+{
+	Assert(principalKeyLocalState.sharedPrincipalKeyState);
+
+	return &principalKeyLocalState.sharedPrincipalKeyState->Locks[TDE_LWLOCK_WAL_KEYS].lock;
+}
+
+/*
  * Attaches to the DSA to local backend
  */
 static void
@@ -301,12 +332,17 @@ set_principal_key_with_keyring(const char *key_name,
 	{
 		/* key rotation */
 		if (dbOid == GLOBAL_DATA_TDE_OID)
+		{
+			/* Updates the cache as well */
 			pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, true);
+		}
 		else
+		{
 			pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, true);
 
-		clear_principal_key_cache(curr_principal_key->keyInfo.databaseId);
-		push_principal_key_to_cache(new_principal_key);
+			clear_principal_key_cache(dbOid);
+			push_principal_key_to_cache(new_principal_key);
+		}
 	}
 
 	LWLockRelease(lock_files);
@@ -365,12 +401,17 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 	memcpy(new_principal_key->keyData, keyInfo->data.data, keyInfo->data.len);
 
 	if (xlrec->databaseId == GLOBAL_DATA_TDE_OID)
+	{
+		/* Updates the cache as well */
 		pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, false);
+	}
 	else
+	{
 		pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, false);
 
-	clear_principal_key_cache(curr_principal_key->keyInfo.databaseId);
-	push_principal_key_to_cache(new_principal_key);
+		clear_principal_key_cache(xlrec->databaseId);
+		push_principal_key_to_cache(new_principal_key);
+	}
 
 	LWLockRelease(tde_lwlock_enc_keys());
 
@@ -453,6 +494,84 @@ principal_key_startup_cleanup(Oid databaseId)
 	clear_principal_key_cache(databaseId);
 
 	pg_tde_delete_tde_files(databaseId);
+}
+
+/*
+ * Replaces the server principal key in the cache, or just removes it if the
+ * key is NULL.
+ *
+ * Must be called with the exclusive tde_lwlock_wal_keys held, along with the
+ * matching change of the WAL keys file. So the readers that hold only that lock
+ * never see the file and the principal key that don't match.
+ *
+ * Any pointer to the server key previously obtained from the cache becomes
+ * invalid.
+ */
+void
+pg_tde_set_server_key_cache(const TDEPrincipalKey *key)
+{
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_EXCLUSIVE));
+	Assert(key == NULL || key->keyInfo.databaseId == GLOBAL_DATA_TDE_OID);
+
+	clear_principal_key_cache(GLOBAL_DATA_TDE_OID);
+
+	if (key != NULL)
+		push_principal_key_to_cache(unconstify(TDEPrincipalKey *, key));
+}
+
+/*
+ * Copies the server principal key into *key. Returns false if there is no
+ * server key.
+ *
+ * Unlike GetPrincipalKey(), it needs tde_lwlock_wal_keys (in any mode) instead
+ * of tde_lwlock_enc_keys, never switches the lock, and doesn't fall back to
+ * the default principal key. This is what the WAL read/write callbacks have to
+ * use, see the comments to tde_lwlock_wal_keys().
+ *
+ * The key is copied as the cache entry can be gone once the lock is released.
+ */
+bool
+pg_tde_get_server_key_copy(TDEPrincipalKey *key)
+{
+	Oid			dbOid = GLOBAL_DATA_TDE_OID;
+	TDEPrincipalKey *cache_entry;
+	TDESignedPrincipalKeyInfo *key_info;
+	TDEPrincipalKey *loaded_key;
+
+	Assert(LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_SHARED) ||
+		   LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_EXCLUSIVE));
+
+	cache_entry = (TDEPrincipalKey *) dshash_find(get_principal_key_hash(),
+												  &dbOid, false);
+	if (likely(cache_entry != NULL))
+	{
+		*key = *cache_entry;
+		dshash_release_lock(get_principal_key_hash(), cache_entry);
+		return true;
+	}
+
+	/*
+	 * Not in the cache, e.g. the key was set by the WAL replay. Load the key
+	 * the file header refers to. The header can't change while we hold the
+	 * lock, so it is safe to cache the key even with the shared lock: anyone
+	 * else doing the same would load the very same key.
+	 */
+	key_info = pg_tde_get_server_key_info();
+	if (key_info == NULL)
+		return false;
+
+	loaded_key = pg_tde_load_principal_key(key_info);
+	Assert(loaded_key->keyInfo.databaseId == GLOBAL_DATA_TDE_OID);
+
+	*key = *loaded_key;
+	push_principal_key_to_cache(loaded_key);
+
+	explicit_bzero(loaded_key, sizeof(TDEPrincipalKey));
+	pfree(loaded_key);
+	pfree(key_info);
+
+	return true;
 }
 
 static void
@@ -1419,13 +1538,18 @@ pg_tde_rotate_default_key_for_database(TDEPrincipalKey *oldKey, TDEPrincipalKey 
 	*newKey = *newKeyTemplate;
 	newKey->keyInfo.databaseId = oldKey->keyInfo.databaseId;
 
-	if (oldKey->keyInfo.databaseId == GLOBAL_DATA_TDE_OID)
+	if (newKey->keyInfo.databaseId == GLOBAL_DATA_TDE_OID)
+	{
+		/* Updates the cache as well */
 		pg_tde_perform_rotate_server_key(oldKey, newKey, true);
+	}
 	else
+	{
 		pg_tde_perform_rotate_key(oldKey, newKey, true);
 
-	clear_principal_key_cache(oldKey->keyInfo.databaseId);
-	push_principal_key_to_cache(newKey);
+		clear_principal_key_cache(newKey->keyInfo.databaseId);
+		push_principal_key_to_cache(newKey);
+	}
 
 	pfree(newKey);
 }
