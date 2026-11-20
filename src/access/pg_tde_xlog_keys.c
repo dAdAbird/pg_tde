@@ -872,8 +872,8 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
  * then, and the WAL keys are re-encrypted with it. Like redo of a rotation,
  * this needs both keys to be available in their key providers.
  *
- * Nothing is done if the file is newer than the record, as tells the WAL
- * position kept in it.
+ * The caller must hold an exclusive tde_lwlock_enc_keys and make sure the
+ * file is not newer than the record, see xl_tde_perform_key_change().
  *
  * lsn: start of the record being replayed.
  */
@@ -882,13 +882,7 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XL
 {
 	TDESignedPrincipalKeyInfo *curr_key_info;
 
-	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
-
-	if (pg_tde_server_key_is_newer(lsn))
-	{
-		LWLockRelease(tde_lwlock_enc_keys());
-		return;
-	}
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 
 	curr_key_info = pg_tde_get_server_key_info();
 
@@ -920,8 +914,6 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XL
 
 	if (curr_key_info != NULL)
 		pfree(curr_key_info);
-
-	LWLockRelease(tde_lwlock_enc_keys());
 }
 #endif
 
@@ -1077,18 +1069,13 @@ pg_tde_delete_server_key(void)
  * It is replaced when the primary sets the next server key, see
  * pg_tde_save_server_key_redo().
  *
- * Nothing is done if the file is newer than the record, as tells the WAL
- * position kept in it.
- *
- * lsn: start of the record being replayed.
+ * The caller must hold an exclusive tde_lwlock_enc_keys and make sure the
+ * file is not newer than the record, see xl_tde_perform_key_change().
  */
 void
-pg_tde_delete_server_key_redo(XLogRecPtr lsn)
+pg_tde_delete_server_key_redo(void)
 {
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
-
-	if (pg_tde_server_key_is_newer(lsn))
-		return;
 
 	if (pg_tde_count_wal_ranges_in_file() != 0)
 	{

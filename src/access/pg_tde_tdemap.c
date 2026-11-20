@@ -78,7 +78,7 @@
  *
  * Whichever complete generation the copy has got, redo brings it to the state
  * of the WAL. The principal key file has the WAL position its key was set at,
- * see pg_tde_principal_key_is_newer().
+ * see xl_tde_perform_key_change().
  */
 
 /* Principal key file on disk */
@@ -727,8 +727,12 @@ pg_tde_principal_key_is_newer(Oid dbOid, XLogRecPtr lsn)
 }
 
 /*
- * It doesn't overwrite an existing principal key. The file may already hold a
- * newer (rotated) key when we're replaying an old record.
+ * It doesn't overwrite an existing principal key. The primary writes this
+ * record only when the database has no principal key, so the file is there
+ * if the record is replayed once again, or if we have set the key on our own.
+ *
+ * The caller must hold an exclusive tde_lwlock_enc_keys and make sure the
+ * file is not newer than the record, see xl_tde_perform_key_change().
  *
  * lsn: start of the record being replayed.
  */
@@ -737,13 +741,13 @@ pg_tde_save_principal_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info,
 {
 	char		pkey_path[MAXPGPATH];
 
-	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 
-	if (!pg_tde_set_pkey_file_path(signed_key_info->data.databaseId, pkey_path) ||
-		access(pkey_path, F_OK) != 0)
-		pg_tde_save_signed_principal_key(signed_key_info, lsn);
+	if (pg_tde_set_pkey_file_path(signed_key_info->data.databaseId, pkey_path) &&
+		access(pkey_path, F_OK) == 0)
+		return;
 
-	LWLockRelease(tde_lwlock_enc_keys());
+	pg_tde_save_signed_principal_key(signed_key_info, lsn);
 }
 
 /*

@@ -55,8 +55,7 @@ extern TDEPrincipalKey *GetPrincipalKey(Oid dbOid, void *lockMode);
 extern void clean_fe_server_principal_key_cache(void);
 #endif
 
-extern void xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec, XLogRecPtr lsn);
-extern void xl_tde_perform_delete_key(Oid dbOid, XLogRecPtr lsn);
+extern void xl_tde_perform_key_change(uint8 info, const char *rec, XLogRecPtr lsn);
 extern bool pg_tde_is_provider_used(Oid databaseOid, Oid providerId);
 extern void pg_tde_verify_provider_keys_in_use(GenericKeyring *proposed_provider);
 

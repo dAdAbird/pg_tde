@@ -49,32 +49,17 @@ tdeheap_rmgr_redo(XLogReaderState *record)
 
 		tde_smgr_create_key_redo(&xlrec->rlocator);
 	}
-	else if (info == XLOG_TDE_ADD_PRINCIPAL_KEY)
+	else if (info == XLOG_TDE_ADD_PRINCIPAL_KEY ||
+			 info == XLOG_TDE_ROTATE_PRINCIPAL_KEY ||
+			 info == XLOG_TDE_DELETE_PRINCIPAL_KEY)
 	{
-		TDESignedPrincipalKeyInfo *mkey = (TDESignedPrincipalKeyInfo *) XLogRecGetData(record);
-
-		if (mkey->data.databaseId == GLOBAL_DATA_TDE_OID)
-			pg_tde_save_server_key_redo(mkey, record->ReadRecPtr);
-		else
-			pg_tde_save_principal_key_redo(mkey, record->ReadRecPtr);
+		xl_tde_perform_key_change(info, XLogRecGetData(record), record->ReadRecPtr);
 	}
 	else if (info == XLOG_TDE_DELETE_RELATION_KEY)
 	{
 		XLogRelKey *xlrec = (XLogRelKey *) XLogRecGetData(record);
 
 		tde_smgr_delete_leftover_key_redo(&xlrec->rlocator);
-	}
-	else if (info == XLOG_TDE_ROTATE_PRINCIPAL_KEY)
-	{
-		XLogPrincipalKeyRotate *xlrec = (XLogPrincipalKeyRotate *) XLogRecGetData(record);
-
-		xl_tde_perform_rotate_key(xlrec, record->ReadRecPtr);
-	}
-	else if (info == XLOG_TDE_DELETE_PRINCIPAL_KEY)
-	{
-		Oid			dbOid = *((Oid *) XLogRecGetData(record));
-
-		xl_tde_perform_delete_key(dbOid, record->ReadRecPtr);
 	}
 	else if (info == XLOG_TDE_WRITE_KEY_PROVIDER)
 	{
