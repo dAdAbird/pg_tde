@@ -1110,6 +1110,7 @@ pg_tde_get_key_info(PG_FUNCTION_ARGS, Oid dbOid)
 		{
 			values[1] = CStringGetTextDatum(keyring->provider_name);
 			isnull[1] = false;
+			pfree(keyring);
 		}
 		else
 			isnull[1] = true;
@@ -1121,8 +1122,6 @@ pg_tde_get_key_info(PG_FUNCTION_ARGS, Oid dbOid)
 		ts = (ts * USECS_PER_SEC) + principal_key->keyInfo.creationTime.tv_usec;
 		values[3] = TimestampTzGetDatum(ts);
 		isnull[3] = false;
-
-		pfree(keyring);
 	}
 
 	LWLockRelease(tde_lwlock_enc_keys());
