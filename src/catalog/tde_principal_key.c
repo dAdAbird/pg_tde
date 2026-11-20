@@ -237,6 +237,24 @@ tde_lwlock_wal_keys(void)
 }
 
 /*
+ * Returns the WAL position to save in the key file along with a principal key
+ * that is about to be set. See xl_tde_perform_key_change() for how redo uses
+ * it.
+ *
+ * Must be called before the WAL record of the change is written, with an
+ * exclusive tde_lwlock_enc_keys held until then. The lock keeps the other
+ * changes of principal keys away, so that record is the first of them to
+ * start at or after the returned position.
+ */
+XLogRecPtr
+pg_tde_key_change_lsn(void)
+{
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+
+	return GetXLogInsertRecPtr();
+}
+
+/*
  * Attaches to the DSA to local backend
  */
 static void
@@ -338,7 +356,7 @@ set_principal_key_with_keyring(const char *key_name,
 		}
 		else
 		{
-			pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, true);
+			pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, true, InvalidXLogRecPtr);
 
 			clear_principal_key_cache(dbOid);
 			push_principal_key_to_cache(new_principal_key);
@@ -354,9 +372,11 @@ set_principal_key_with_keyring(const char *key_name,
 
 /*
  * Rotate keys on a standby.
+ *
+ * lsn: start of the record being replayed.
  */
 void
-xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
+xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec, XLogRecPtr lsn)
 {
 	TDEPrincipalKey *curr_principal_key;
 	TDEPrincipalKey *new_principal_key;
@@ -365,6 +385,17 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 	KeyringReturnCode return_code;
 
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
+
+	if (pg_tde_principal_key_is_newer(xlrec->databaseId, lsn))
+	{
+		ereport(LOG,
+				errmsg("skipping rotation of principal key of database %u to \"%s\"",
+					   xlrec->databaseId, xlrec->keyName),
+				errdetail("The principal key was set later than that."));
+
+		LWLockRelease(tde_lwlock_enc_keys());
+		return;
+	}
 
 	curr_principal_key = GetPrincipalKeyNoDefault(xlrec->databaseId, LW_EXCLUSIVE);
 	new_keyring = GetKeyProviderByID(xlrec->keyringId, xlrec->databaseId);
@@ -431,7 +462,7 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 	}
 	else
 	{
-		pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, false);
+		pg_tde_perform_rotate_key(curr_principal_key, new_principal_key, false, lsn);
 
 		clear_principal_key_cache(xlrec->databaseId);
 		push_principal_key_to_cache(new_principal_key);
@@ -446,9 +477,11 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 
 /*
  * Delete the principal key on a standby.
+ *
+ * lsn: start of the record being replayed.
  */
 void
-xl_tde_perform_delete_key(Oid dbOid)
+xl_tde_perform_delete_key(Oid dbOid, XLogRecPtr lsn)
 {
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
 
@@ -459,6 +492,16 @@ xl_tde_perform_delete_key(Oid dbOid)
 		 * of its own. Its cache entry is removed along with that file.
 		 */
 		pg_tde_delete_server_key_redo();
+	}
+	else if (pg_tde_principal_key_is_newer(dbOid, lsn))
+	{
+		/*
+		 * The key in the file was set after this deletion and relation keys
+		 * may be encrypted with it already.
+		 */
+		ereport(LOG,
+				errmsg("skipping deletion of principal key of database %u", dbOid),
+				errdetail("The principal key was set later than that."));
 	}
 	else
 	{
@@ -1607,7 +1650,7 @@ pg_tde_rotate_default_key_for_database(TDEPrincipalKey *oldKey, TDEPrincipalKey 
 	}
 	else
 	{
-		pg_tde_perform_rotate_key(oldKey, newKey, true);
+		pg_tde_perform_rotate_key(oldKey, newKey, true, InvalidXLogRecPtr);
 
 		clear_principal_key_cache(newKey->keyInfo.databaseId);
 		push_principal_key_to_cache(newKey);

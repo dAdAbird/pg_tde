@@ -56,7 +56,7 @@ tdeheap_rmgr_redo(XLogReaderState *record)
 		if (mkey->data.databaseId == GLOBAL_DATA_TDE_OID)
 			pg_tde_save_server_key_redo(mkey);
 		else
-			pg_tde_save_principal_key_redo(mkey);
+			pg_tde_save_principal_key_redo(mkey, record->ReadRecPtr);
 	}
 	else if (info == XLOG_TDE_DELETE_RELATION_KEY)
 	{
@@ -68,13 +68,13 @@ tdeheap_rmgr_redo(XLogReaderState *record)
 	{
 		XLogPrincipalKeyRotate *xlrec = (XLogPrincipalKeyRotate *) XLogRecGetData(record);
 
-		xl_tde_perform_rotate_key(xlrec);
+		xl_tde_perform_rotate_key(xlrec, record->ReadRecPtr);
 	}
 	else if (info == XLOG_TDE_DELETE_PRINCIPAL_KEY)
 	{
 		Oid			dbOid = *((Oid *) XLogRecGetData(record));
 
-		xl_tde_perform_delete_key(dbOid);
+		xl_tde_perform_delete_key(dbOid, record->ReadRecPtr);
 	}
 	else if (info == XLOG_TDE_WRITE_KEY_PROVIDER)
 	{

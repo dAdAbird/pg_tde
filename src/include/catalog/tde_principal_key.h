@@ -44,6 +44,7 @@ extern Size PrincipalKeyShmemSize(void);
 extern void principal_key_startup_cleanup(Oid databaseId);
 extern LWLock *tde_lwlock_enc_keys(void);
 extern LWLock *tde_lwlock_wal_keys(void);
+extern XLogRecPtr pg_tde_key_change_lsn(void);
 extern bool pg_tde_get_server_key_copy(TDEPrincipalKey *key);
 extern void pg_tde_set_server_key_cache(const TDEPrincipalKey *key);
 extern bool pg_tde_principal_key_configured(Oid databaseId);
@@ -54,8 +55,8 @@ extern TDEPrincipalKey *GetPrincipalKey(Oid dbOid, void *lockMode);
 extern void clean_fe_server_principal_key_cache(void);
 #endif
 
-extern void xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec);
-extern void xl_tde_perform_delete_key(Oid dbOid);
+extern void xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec, XLogRecPtr lsn);
+extern void xl_tde_perform_delete_key(Oid dbOid, XLogRecPtr lsn);
 extern bool pg_tde_is_provider_used(Oid databaseOid, Oid providerId);
 extern void pg_tde_verify_provider_keys_in_use(GenericKeyring *proposed_provider);
 

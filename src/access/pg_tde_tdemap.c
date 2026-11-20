@@ -76,8 +76,9 @@
  *   copying it before the rotation gets all of it. It is removed by the next
  *   change of the principal key, or on the server start.
  *
- * If the copy has got the generation that was replaced meanwhile, redo of the
- * rotation builds the next one from it.
+ * Whichever complete generation the copy has got, redo brings it to the state
+ * of the WAL. The principal key file has the WAL position its key was set at,
+ * see pg_tde_principal_key_is_newer().
  */
 
 /* Principal key file on disk */
@@ -85,6 +86,16 @@ typedef struct TDEFileHeader
 {
 	int32		file_version;
 	TDESignedPrincipalKeyInfo signed_key_info;
+
+	/*
+	 * WAL position the key was set at. All the WAL records that changed the
+	 * principal key of the database earlier start before it, and the record
+	 * of setting this key doesn't. The key files are not brought back to the
+	 * state they had at the redo start, so that is how redo tells the records
+	 * the file is already newer than. InvalidXLogRecPtr if the key was set
+	 * without a WAL record.
+	 */
+	XLogRecPtr	lsn;
 } TDEFileHeader;
 
 /* SMGR key on disk */
@@ -121,7 +132,7 @@ static bool pg_tde_parse_gen_dir_name(const char *name, uint32 *gen);
 static uint32 pg_tde_get_key_gen(Oid dbOid, int elevel);
 static bool pg_tde_set_key_file_path(RelFileLocator rel, char *path);
 static bool pg_tde_set_pkey_file_path(Oid dbOid, char *path);
-static TDESignedPrincipalKeyInfo *pg_tde_read_principal_key_file(const char *path);
+static bool pg_tde_read_principal_key_file(const char *path, TDEFileHeader *fheader);
 static bool pg_tde_read_key_entry(const RelFileLocator *rlocator, TDESmgrKeyEntry *key_entry);
 static void pg_tde_read_key_file(const char *file_path, TDESmgrKeyEntry *key_entry);
 static InternalKey *tde_decrypt_rel_key(const TDEPrincipalKey *principal_key, TDESmgrKeyEntry *key_entry, const RelFileLocator *rlocator);
@@ -131,11 +142,11 @@ static void pg_tde_write_file(const char *path, const void *data, size_t len, bo
 static void pg_tde_durable_write_file(const char *path, const void *data, size_t len);
 #ifndef FRONTEND
 static void pg_tde_set_gen_dir_path(Oid dbOid, uint32 gen, const char *suffix, char *path);
-static uint32 pg_tde_start_key_gen(const TDESignedPrincipalKeyInfo *signed_key_info, char *new_dir);
+static uint32 pg_tde_start_key_gen(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn, char *new_dir);
 static void pg_tde_sync_new_key_gen(Oid dbOid, const char *new_dir);
 static void pg_tde_publish_key_gen(Oid dbOid, uint32 gen, const char *new_dir);
 static void pg_tde_remove_old_key_gens(Oid dbOid, uint32 oldest_to_keep);
-static void pg_tde_save_signed_principal_key(const TDESignedPrincipalKeyInfo *signed_key_info);
+static void pg_tde_save_signed_principal_key(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn);
 static void pg_tde_rotate_rel_key(const char *old_path, const char *new_path, const RelFileLocator *rlocator, const TDEPrincipalKey *old_principal_key, const TDEPrincipalKey *new_principal_key);
 static bool pg_tde_parse_key_file_name(const char *name, Oid *spcOid, RelFileNumber *relNumber);
 static List *pg_tde_list_key_files(Oid dbOid, uint32 gen, Oid spcOid);
@@ -397,15 +408,17 @@ tde_sprint_key(InternalKey *k)
  * a temporary name and writes the principal key file there. Sets new_dir to
  * the path of the directory, and returns the number the generation gets when
  * it is published with pg_tde_publish_key_gen().
+ *
+ * lsn: WAL position to save along with the key, see TDEFileHeader.
  */
 static uint32
-pg_tde_start_key_gen(const TDESignedPrincipalKeyInfo *signed_key_info, char *new_dir)
+pg_tde_start_key_gen(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn, char *new_dir)
 {
 	Oid			dbOid = signed_key_info->data.databaseId;
 	uint32		gen = pg_tde_get_key_gen(dbOid, ERROR) + 1;
 	char		db_dir[MAXPGPATH];
 	char		pkey_path[MAXPGPATH];
-	TDEFileHeader fheader;
+	TDEFileHeader fheader = {0};
 
 	pg_tde_set_db_dir_path(dbOid, "", db_dir);
 	pg_tde_set_gen_dir_path(dbOid, gen, PG_TDE_GEN_DIR_NEW_SUFFIX, new_dir);
@@ -425,6 +438,7 @@ pg_tde_start_key_gen(const TDESignedPrincipalKeyInfo *signed_key_info, char *new
 
 	fheader.file_version = PG_TDE_SMGR_FILE_MAGIC;
 	fheader.signed_key_info = *signed_key_info;
+	fheader.lsn = lsn;
 
 	snprintf(pkey_path, MAXPGPATH, "%s/" PG_TDE_PRINCIPAL_KEY_FILE, new_dir);
 	pg_tde_write_file(pkey_path, &fheader, sizeof(TDEFileHeader), true);
@@ -536,13 +550,14 @@ pg_tde_remove_old_key_gens(Oid dbOid, uint32 oldest_to_keep)
  * with no WAL record written.
  */
 static void
-pg_tde_save_signed_principal_key(const TDESignedPrincipalKeyInfo *signed_key_info)
+pg_tde_save_signed_principal_key(const TDESignedPrincipalKeyInfo *signed_key_info,
+								 XLogRecPtr lsn)
 {
 	Oid			dbOid = signed_key_info->data.databaseId;
 	char		new_dir[MAXPGPATH];
 	uint32		gen;
 
-	gen = pg_tde_start_key_gen(signed_key_info, new_dir);
+	gen = pg_tde_start_key_gen(signed_key_info, lsn, new_dir);
 	pg_tde_sync_new_key_gen(dbOid, new_dir);
 	pg_tde_publish_key_gen(dbOid, gen, new_dir);
 
@@ -692,11 +707,33 @@ pg_tde_ensure_key_dirs_on_start(void)
 }
 
 /*
+ * Checks if the principal key of the database was set later than the WAL
+ * record starting at the given position was written. If so, redo must leave
+ * the key alone: the relation keys are already encrypted with it and the
+ * changes made in between may be impossible to repeat, e.g. the key provider
+ * of an intermediate key may be gone.
+ */
+bool
+pg_tde_principal_key_is_newer(Oid dbOid, XLogRecPtr lsn)
+{
+	char		pkey_path[MAXPGPATH];
+	TDEFileHeader fheader;
+
+	Assert(LWLockHeldByMe(tde_lwlock_enc_keys()));
+
+	return pg_tde_set_pkey_file_path(dbOid, pkey_path) &&
+		pg_tde_read_principal_key_file(pkey_path, &fheader) &&
+		fheader.lsn > lsn;
+}
+
+/*
  * It doesn't overwrite an existing principal key. The file may already hold a
  * newer (rotated) key when we're replaying an old record.
+ *
+ * lsn: start of the record being replayed.
  */
 void
-pg_tde_save_principal_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info)
+pg_tde_save_principal_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn)
 {
 	char		pkey_path[MAXPGPATH];
 
@@ -704,7 +741,7 @@ pg_tde_save_principal_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info)
 
 	if (!pg_tde_set_pkey_file_path(signed_key_info->data.databaseId, pkey_path) ||
 		access(pkey_path, F_OK) != 0)
-		pg_tde_save_signed_principal_key(signed_key_info);
+		pg_tde_save_signed_principal_key(signed_key_info, lsn);
 
 	LWLockRelease(tde_lwlock_enc_keys());
 }
@@ -746,12 +783,12 @@ pg_tde_save_principal_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 
 	if (!write_xlog)
 	{
-		pg_tde_save_signed_principal_key(&signed_key_info);
+		pg_tde_save_signed_principal_key(&signed_key_info, InvalidXLogRecPtr);
 		return;
 	}
 
 	/* Everything that may fail is done before the record is written */
-	gen = pg_tde_start_key_gen(&signed_key_info, new_dir);
+	gen = pg_tde_start_key_gen(&signed_key_info, pg_tde_key_change_lsn(), new_dir);
 	pg_tde_sync_new_key_gen(dbOid, new_dir);
 
 	PG_TDE_START_XLOG_CHANGE(XLOG_TDE_ADD_PRINCIPAL_KEY,
@@ -834,9 +871,11 @@ pg_tde_rotate_rel_key(const char *old_path, const char *new_path,
  * The keys of the current key generation are re-encrypted into the next one,
  * which is then published. The current generation is left as is, it is
  * removed later, see pg_tde_remove_old_key_gens().
+ *
+ * redo_lsn: start of the record being replayed if write_xlog is false.
  */
 void
-pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincipalKey *new_principal_key, bool write_xlog)
+pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincipalKey *new_principal_key, bool write_xlog, XLogRecPtr redo_lsn)
 {
 	Oid			dbOid = new_principal_key->keyInfo.databaseId;
 	TDESignedPrincipalKeyInfo signed_key_info;
@@ -867,7 +906,9 @@ pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincip
 
 	pg_tde_sign_principal_key_info(&signed_key_info, new_principal_key);
 
-	new_gen = pg_tde_start_key_gen(&signed_key_info, new_dir);
+	new_gen = pg_tde_start_key_gen(&signed_key_info,
+								   write_xlog ? pg_tde_key_change_lsn() : redo_lsn,
+								   new_dir);
 	pg_tde_set_gen_dir_path(dbOid, old_gen, "", old_dir);
 
 	key_files = pg_tde_list_key_files(dbOid, old_gen, InvalidOid);
@@ -1242,23 +1283,27 @@ TDESignedPrincipalKeyInfo *
 pg_tde_get_principal_key_info(Oid dbOid)
 {
 	char		pkey_path[MAXPGPATH];
+	TDEFileHeader fheader;
+	TDESignedPrincipalKeyInfo *signed_key_info;
 
-	if (!pg_tde_set_pkey_file_path(dbOid, pkey_path))
+	if (!pg_tde_set_pkey_file_path(dbOid, pkey_path) ||
+		!pg_tde_read_principal_key_file(pkey_path, &fheader))
 		return NULL;
 
-	return pg_tde_read_principal_key_file(pkey_path);
+	signed_key_info = palloc_object(TDESignedPrincipalKeyInfo);
+	*signed_key_info = fheader.signed_key_info;
+
+	return signed_key_info;
 }
 
 /*
- * Reads the principal key file. Returns NULL if there is no such file.
+ * Reads the principal key file. Returns false if there is no such file.
  */
-static TDESignedPrincipalKeyInfo *
-pg_tde_read_principal_key_file(const char *pkey_path)
+static bool
+pg_tde_read_principal_key_file(const char *pkey_path, TDEFileHeader *fheader)
 {
 	int			fd;
-	TDESignedPrincipalKeyInfo *signed_key_info;
 	off_t		bytes_read;
-	TDEFileHeader fheader;
 
 	fd = OpenTransientFile(pkey_path, O_RDONLY | PG_BINARY);
 
@@ -1266,14 +1311,14 @@ pg_tde_read_principal_key_file(const char *pkey_path)
 	if (fd < 0)
 	{
 		if (errno == ENOENT)
-			return NULL;
+			return false;
 
 		ereport(ERROR,
 				errcode_for_file_access(),
 				errmsg("could not open tde file \"%s\": %m", pkey_path));
 	}
 
-	bytes_read = pg_pread(fd, &fheader, sizeof(TDEFileHeader), 0);
+	bytes_read = pg_pread(fd, fheader, sizeof(TDEFileHeader), 0);
 	if (bytes_read < 0)
 	{
 		int			save_errno = errno;
@@ -1288,7 +1333,7 @@ pg_tde_read_principal_key_file(const char *pkey_path)
 	CloseTransientFile(fd);
 
 	if (bytes_read == 0)
-		return NULL;
+		return false;
 
 	if (bytes_read != sizeof(TDEFileHeader))
 	{
@@ -1298,7 +1343,7 @@ pg_tde_read_principal_key_file(const char *pkey_path)
 					   pkey_path, (ssize_t) bytes_read, sizeof(TDEFileHeader)));
 	}
 
-	if (FILEMAGIC_TYPE(fheader.file_version) != FILEMAGIC_TYPE(PG_TDE_SMGR_FILE_MAGIC))
+	if (FILEMAGIC_TYPE(fheader->file_version) != FILEMAGIC_TYPE(PG_TDE_SMGR_FILE_MAGIC))
 	{
 		ereport(ERROR,
 				errcode(ERRCODE_DATA_CORRUPTED),
@@ -1306,10 +1351,7 @@ pg_tde_read_principal_key_file(const char *pkey_path)
 				errdetail("Getting principal key from the file."));
 	}
 
-	signed_key_info = palloc_object(TDESignedPrincipalKeyInfo);
-	*signed_key_info = fheader.signed_key_info;
-
-	return signed_key_info;
+	return true;
 }
 
 /*

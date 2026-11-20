@@ -145,6 +145,48 @@ $stdout =
   $replica->safe_psql('other', 'SELECT * FROM test_default ORDER BY x;');
 is($stdout, "1\n2", 'can read from test_default after the replica restart');
 
+# check that the replica restart doesn't replay the changes of the principal
+# key over the key that was set after them
+$primary->safe_psql('postgres', 'CREATE DATABASE newer;');
+$primary->safe_psql(
+	'newer', qq(
+	CREATE EXTENSION pg_tde;
+	SELECT pg_tde_add_database_key_provider_file('newer-vault', '$keydir/newer.keys');
+	SELECT pg_tde_create_key_using_database_key_provider('newer-key-1', 'newer-vault');
+	SELECT pg_tde_create_key_using_database_key_provider('newer-key-2', 'newer-vault');
+	SELECT pg_tde_create_key_using_database_key_provider('newer-key-3', 'newer-vault');
+	SELECT pg_tde_set_key_using_database_key_provider('newer-key-1', 'newer-vault');
+
+	-- The replica starts the replay from here
+	CHECKPOINT;
+
+	SELECT pg_tde_set_key_using_database_key_provider('newer-key-2', 'newer-vault');
+	SELECT pg_tde_delete_key();
+	SELECT pg_tde_set_key_using_database_key_provider('newer-key-3', 'newer-vault');
+
+	CREATE TABLE test_newer (x int PRIMARY KEY) USING tde_heap;
+	INSERT INTO test_newer (x) VALUES (1), (2);
+));
+$primary->wait_for_catchup('replica');
+
+$replica->restart;
+
+# The replay restores the table in shared buffers. Make a restartpoint and
+# restart once again, so the table has to be written and read with the key
+# files left by the replay.
+$primary->safe_psql('postgres', 'CHECKPOINT;');
+$primary->wait_for_catchup('replica');
+$replica->safe_psql('postgres', 'CHECKPOINT;');
+$replica->restart;
+
+$stdout =
+  $replica->safe_psql('newer', 'SELECT * FROM test_newer ORDER BY x;');
+is($stdout, "1\n2", 'can read from test_newer after the replica restart');
+
+$stdout =
+  $replica->safe_psql('newer', 'SELECT key_name FROM pg_tde_key_info();');
+is($stdout, 'newer-key-3', 'the replica uses the key that was set last');
+
 $replica->stop;
 $primary->stop;
 

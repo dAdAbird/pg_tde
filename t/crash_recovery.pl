@@ -208,6 +208,35 @@ $stdout =
   $node->safe_psql('empty', 'SELECT key_name FROM pg_tde_key_info();');
 is($stdout, '', 'database still has no principal key');
 
+# Check that redo leaves alone the principal key that was set later than the
+# record being replayed. Otherwise, the rotation moves the relation key to the
+# old principal key and the deletion leaves it without any.
+$node->safe_psql(
+	'empty', qq(
+	SELECT pg_tde_create_key_using_database_key_provider('empty_key_2', 'empty_keyring');
+	SELECT pg_tde_set_key_using_database_key_provider('empty_key', 'empty_keyring');
+	CHECKPOINT;
+
+	SELECT pg_tde_set_key_using_database_key_provider('empty_key_1', 'empty_keyring');
+	SELECT pg_tde_delete_key();
+	SELECT pg_tde_set_key_using_database_key_provider('empty_key_2', 'empty_keyring');
+
+	CREATE TABLE test_newer (x int PRIMARY KEY) USING tde_heap;
+	INSERT INTO test_newer (x) VALUES (1), (2);
+));
+
+$node->kill9;
+
+PGTDE::poll_start($node);
+
+$stdout = $node->safe_psql('empty', 'TABLE test_newer;');
+is($stdout, "1\n2",
+	'can read data after redo of the changes preceding the current key');
+
+$stdout =
+  $node->safe_psql('empty', 'SELECT key_name FROM pg_tde_key_info();');
+is($stdout, 'empty_key_2', 'database uses the key that was set last');
+
 $node->stop;
 
 done_testing();
