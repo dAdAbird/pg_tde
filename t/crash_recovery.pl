@@ -127,6 +127,41 @@ PGTDE::poll_start($node);
 $stdout = $node->safe_psql('postgres', "SELECT nextval('seq_unlogged');");
 is($stdout, '1', 'sequence has been reset and can be used');
 
+# A database starts using the default key when its first relation key is
+# created, rather than with a call of an SQL function. Check that redo of the
+# preceding key deletion doesn't leave the relation key without the principal
+# key. The checkpoint is needed as redo of the extension creation removes all
+# the key files of the database.
+$node->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_create_key_using_global_key_provider('default_key', 'global_keyring');
+	SELECT pg_tde_set_default_key_using_global_key_provider('default_key', 'global_keyring');
+	CREATE DATABASE other;
+));
+$node->safe_psql(
+	'other', qq(
+	CREATE EXTENSION pg_tde;
+
+	SELECT pg_tde_add_database_key_provider_file('other_keyring', '$keydir/other.keys');
+	SELECT pg_tde_create_key_using_database_key_provider('other_key', 'other_keyring');
+	SELECT pg_tde_set_key_using_database_key_provider('other_key', 'other_keyring');
+	CHECKPOINT;
+	SELECT pg_tde_delete_key();
+
+	CREATE TABLE test_default (x int PRIMARY KEY) USING tde_heap;
+	INSERT INTO test_default (x) VALUES (1), (2);
+));
+
+$node->kill9;
+
+PGTDE::poll_start($node);
+
+$stdout = $node->safe_psql('other', 'TABLE test_default;');
+is($stdout, "1\n2", 'can read data encrypted with the default key');
+
+$stdout = $node->safe_psql('other', 'SELECT key_name FROM pg_tde_key_info();');
+is($stdout, 'default_key', 'database still uses the default key');
+
 $node->stop;
 
 done_testing();

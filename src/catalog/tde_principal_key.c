@@ -421,6 +421,31 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 }
 
 /*
+ * Delete the principal key on a standby.
+ */
+void
+xl_tde_perform_delete_key(Oid dbOid)
+{
+	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
+
+	pg_tde_delete_principal_key_redo(dbOid);
+
+	/*
+	 * The key must leave the cache along with its file. Otherwise, the keys
+	 * of relations created later would be encrypted with the deleted key
+	 * instead of the one the database uses by that time.
+	 *
+	 * Not the server key though. It is kept in the WAL keys file, which is
+	 * not removed here, and its cache entry must change along with that file,
+	 * see the comments to tde_lwlock_wal_keys().
+	 */
+	if (dbOid != GLOBAL_DATA_TDE_OID)
+		clear_principal_key_cache(dbOid);
+
+	LWLockRelease(tde_lwlock_enc_keys());
+}
+
+/*
  * ------------------------------
  * Principal key cache realted stuff
  */
@@ -1305,14 +1330,22 @@ GetPrincipalKey(Oid dbOid, LWLockMode lockMode)
 
 		/*
 		 * We have to write default principal key info to database keys file.
-		 * However we cannot write XLOG records about this operation as
-		 * current funcion may be invoked during server startup/recovery where
-		 * WAL writes forbidden.
+		 *
+		 * The server key is set on the server start, when WAL writes are
+		 * forbidden, so we cannot write XLOG records about it.
+		 *
+		 * For a database, the record must be written. Otherwise, the WAL
+		 * replay knows nothing about the file and may break it. E.g. redo of
+		 * a preceding deletion of the principal key removes the file, leaving
+		 * relation keys created after it without their principal key. The
+		 * only exception is recovery, when WAL writes are forbidden as well.
+		 * But there, the file is created by redo of the record the primary
+		 * has written.
 		 */
 		if (dbOid == GLOBAL_DATA_TDE_OID)
 			pg_tde_save_server_key(newPrincipalKey, false);
 		else
-			pg_tde_save_principal_key(newPrincipalKey, false);
+			pg_tde_save_principal_key(newPrincipalKey, !RecoveryInProgress());
 
 		push_principal_key_to_cache(newPrincipalKey);
 

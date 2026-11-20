@@ -84,6 +84,42 @@ $stdout =
   $replica->safe_psql('postgres', 'SELECT * FROM test_enc2 ORDER BY x;');
 is($stdout, "1\n2", 'can read from test_enc2');
 
+# check that the replica doesn't keep using a deleted principal key
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_create_key_using_global_key_provider('default-key', 'file-vault');
+	SELECT pg_tde_set_default_key_using_global_key_provider('default-key', 'file-vault');
+	CREATE DATABASE other;
+));
+$primary->safe_psql(
+	'other', qq(
+	CREATE EXTENSION pg_tde;
+	SELECT pg_tde_add_database_key_provider_file('other-vault', '$keydir/other.keys');
+	SELECT pg_tde_create_key_using_database_key_provider('other-key', 'other-vault');
+	SELECT pg_tde_set_key_using_database_key_provider('other-key', 'other-vault');
+
+	-- Makes the replica load the key into the cache
+	CREATE TABLE test_other (x int PRIMARY KEY) USING tde_heap;
+	DROP TABLE test_other;
+
+	SELECT pg_tde_delete_key();
+
+	CREATE TABLE test_default (x int PRIMARY KEY) USING tde_heap;
+	INSERT INTO test_default (x) VALUES (1), (2);
+
+	CHECKPOINT;
+));
+$primary->wait_for_catchup('replica');
+
+# Make a restartpoint, so the replica doesn't replay the records above after
+# the restart and has to rely on the key files it has written.
+$replica->safe_psql('postgres', 'CHECKPOINT;');
+$replica->restart;
+
+$stdout =
+  $replica->safe_psql('other', 'SELECT * FROM test_default ORDER BY x;');
+is($stdout, "1\n2", 'can read from test_default after the replica restart');
+
 $replica->stop;
 $primary->stop;
 

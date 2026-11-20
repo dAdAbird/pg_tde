@@ -996,17 +996,18 @@ pg_tde_perform_rotate_key(const TDEPrincipalKey *principal_key, const TDEPrincip
 
 /*
  * Removes the principal key file. The key generation stays, with no keys in
- * it.
+ * it. The caller must hold an exclusive tde_lwlock_enc_keys and remove the key
+ * from the cache.
  */
 void
 pg_tde_delete_principal_key_redo(Oid dbOid)
 {
 	char		pkey_path[MAXPGPATH];
 
-	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+
 	if (pg_tde_set_pkey_file_path(dbOid, pkey_path))
 		durable_unlink(pkey_path, WARNING);
-	LWLockRelease(tde_lwlock_enc_keys());
 }
 
 /*

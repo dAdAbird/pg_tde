@@ -74,7 +74,7 @@ tdeheap_rmgr_redo(XLogReaderState *record)
 	{
 		Oid			dbOid = *((Oid *) XLogRecGetData(record));
 
-		pg_tde_delete_principal_key_redo(dbOid);
+		xl_tde_perform_delete_key(dbOid);
 	}
 	else if (info == XLOG_TDE_WRITE_KEY_PROVIDER)
 	{
