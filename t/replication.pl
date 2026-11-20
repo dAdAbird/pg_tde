@@ -60,6 +60,31 @@ $stdout =
   $replica->safe_psql('postgres', 'SELECT * FROM test_plain ORDER BY x;');
 is($stdout, "3\n4", 'can read from test_plain on the replica');
 
+# check that the replica deletes the server key along with the primary
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_add_global_key_provider_file('tmp-vault', '$keydir/tmp.key');
+	SELECT pg_tde_create_key_using_global_key_provider('tmp-default-key', 'tmp-vault');
+	-- Becomes the server key as well
+	SELECT pg_tde_set_default_key_using_global_key_provider('tmp-default-key', 'tmp-vault');
+));
+$primary->wait_for_catchup('replica');
+
+$stdout = $replica->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, 'tmp-default-key', 'the replica has the server key');
+
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_delete_default_key();
+	SELECT pg_tde_delete_global_key_provider('tmp-vault');
+));
+$primary->wait_for_catchup('replica');
+
+$stdout = $replica->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, '', 'the replica has no server key after its deletion');
+
 # check primary crash with WAL encryption
 #
 # TODO: This does not seem to actually test WAL encryption

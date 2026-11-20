@@ -428,19 +428,25 @@ xl_tde_perform_delete_key(Oid dbOid)
 {
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
 
-	pg_tde_delete_principal_key_redo(dbOid);
+	if (dbOid == GLOBAL_DATA_TDE_OID)
+	{
+		/*
+		 * The server key is kept in the WAL keys file rather than in a file
+		 * of its own. Its cache entry is removed along with that file.
+		 */
+		pg_tde_delete_server_key_redo();
+	}
+	else
+	{
+		pg_tde_delete_principal_key_redo(dbOid);
 
-	/*
-	 * The key must leave the cache along with its file. Otherwise, the keys
-	 * of relations created later would be encrypted with the deleted key
-	 * instead of the one the database uses by that time.
-	 *
-	 * Not the server key though. It is kept in the WAL keys file, which is
-	 * not removed here, and its cache entry must change along with that file,
-	 * see the comments to tde_lwlock_wal_keys().
-	 */
-	if (dbOid != GLOBAL_DATA_TDE_OID)
+		/*
+		 * The key must leave the cache along with its file. Otherwise, the
+		 * keys of relations created later would be encrypted with the deleted
+		 * key instead of the one the database uses by that time.
+		 */
 		clear_principal_key_cache(dbOid);
+	}
 
 	LWLockRelease(tde_lwlock_enc_keys());
 }

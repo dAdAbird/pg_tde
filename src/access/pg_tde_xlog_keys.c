@@ -952,6 +952,35 @@ pg_tde_delete_server_key(void)
 	LWLockRelease(tde_lwlock_wal_keys());
 }
 
+/*
+ * Redo of the server key deletion.
+ *
+ * WAL keys are not replicated, every server has its own. So unlike the
+ * primary at the time of the deletion, we may have some: a standby can have
+ * WAL encryption enabled on its own, and during a crash recovery the file may
+ * be newer than the record being replayed. Removing the file would make WAL
+ * encrypted with these keys unreadable, hence the server key is kept then.
+ */
+void
+pg_tde_delete_server_key_redo(void)
+{
+	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+
+	if (pg_tde_count_wal_ranges_in_file() != 0)
+	{
+		ereport(WARNING,
+				errmsg("cannot delete server principal key"),
+				errdetail("There are WAL encryption keys."));
+		return;
+	}
+
+	/* Remove whole key map file, and the key from the cache along with it */
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+	durable_unlink(get_wal_key_file_path(), WARNING);
+	pg_tde_set_server_key_cache(NULL);
+	LWLockRelease(tde_lwlock_wal_keys());
+}
+
 
 /*****************************************
  * Functions for migrating old wal_keys into a new format file.

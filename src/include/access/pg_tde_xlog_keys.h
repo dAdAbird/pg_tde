@@ -87,6 +87,7 @@ typedef struct WALKeyCacheRec
 extern int	pg_tde_count_wal_ranges_in_file(void);
 extern void pg_tde_create_wal_range(WalEncryptionRange *range, WalEncryptionRangeType type, int key_len);
 extern void pg_tde_delete_server_key(void);
+extern void pg_tde_delete_server_key_redo(void);
 extern WALKeyCacheRec *pg_tde_fetch_wal_keys(WalLocation start);
 extern void pg_tde_free_wal_key_cache(void);
 extern WALKeyCacheRec *pg_tde_get_last_wal_key(void);
