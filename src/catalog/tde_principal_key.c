@@ -341,10 +341,15 @@ set_principal_key_with_keyring(const char *key_name,
 	{
 		/* First key created for the database */
 		if (dbOid == GLOBAL_DATA_TDE_OID)
+		{
+			/* Updates the cache as well */
 			pg_tde_save_server_key(new_principal_key, true);
+		}
 		else
+		{
 			pg_tde_save_principal_key(new_principal_key, true);
-		push_principal_key_to_cache(new_principal_key);
+			push_principal_key_to_cache(new_principal_key);
+		}
 	}
 	else
 	{
@@ -1123,8 +1128,8 @@ pg_tde_delete_default_key(PG_FUNCTION_ARGS)
 					errmsg("cannot delete default principal key"),
 					errhint("There are WAL encryption keys."));
 
+		/* Removes the key from the cache as well */
 		pg_tde_delete_server_key();
-		clear_principal_key_cache(GLOBAL_DATA_TDE_OID);
 	}
 
 	/*
@@ -1456,11 +1461,15 @@ GetPrincipalKey(Oid dbOid, LWLockMode lockMode)
 		 * has written.
 		 */
 		if (dbOid == GLOBAL_DATA_TDE_OID)
+		{
+			/* Updates the cache as well */
 			pg_tde_save_server_key(newPrincipalKey, false);
+		}
 		else
+		{
 			pg_tde_save_principal_key(newPrincipalKey, !RecoveryInProgress());
-
-		push_principal_key_to_cache(newPrincipalKey);
+			push_principal_key_to_cache(newPrincipalKey);
+		}
 
 		pfree(newPrincipalKey);
 

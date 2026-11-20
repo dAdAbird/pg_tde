@@ -909,6 +909,47 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 }
 #endif
 
+/*
+ * Writes a WAL keys file that has nothing but the header into a temporary
+ * file, to replace the real one with pg_tde_replace_wal_key_file(). So
+ * everything that may fail is done before the replacement, which can be left
+ * for a critical section then.
+ */
+static void
+pg_tde_write_wal_key_file_aside(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn, char *tmp_path)
+{
+	int			fd;
+	off_t		curr_pos = 0;
+
+	snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
+
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+	fd = pg_tde_open_wal_key_file_write(tmp_path, signed_key_info, lsn, true, &curr_pos);
+	CloseTransientFile(fd);
+	LWLockRelease(tde_lwlock_wal_keys());
+}
+
+/*
+ * Replaces the WAL keys file with the one written aside.
+ *
+ * Takes an exclusive tde_lwlock_wal_keys and returns with it held. So the
+ * caller can change the cache of the server key under the same lock, and it
+ * is the caller who releases it.
+ */
+static void
+pg_tde_replace_wal_key_file(const char *tmp_path)
+{
+	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+
+#ifdef FRONTEND
+	/* The frontend version ignores elevel */
+	if (durable_rename(tmp_path, get_wal_key_file_path(), ERROR) != 0)
+		exit(1);
+#else
+	durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
+#endif
+}
+
 #ifndef FRONTEND
 /*
  * Redo of setting the server key.
@@ -939,12 +980,10 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XL
 
 	if (curr_key_info == NULL)
 	{
-		int			fd;
-		off_t		curr_pos;
+		char		tmp_path[MAXPGPATH];
 
-		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-		fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), signed_key_info, lsn, false, &curr_pos);
-		CloseTransientFile(fd);
+		pg_tde_write_wal_key_file_aside(signed_key_info, lsn, tmp_path);
+		pg_tde_replace_wal_key_file(tmp_path);
 		LWLockRelease(tde_lwlock_wal_keys());
 	}
 	else if (curr_key_info->data.keyringId != signed_key_info->data.keyringId ||
@@ -969,12 +1008,12 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XL
 #endif
 
 /*
- * Creates the key file and saves the principal key information.
+ * Creates the WAL keys file with the given server key. If the file exists, it
+ * is replaced along with all the WAL keys it has. The file is written aside
+ * and then renamed into place.
  *
- * If the file pre-exist, it truncates the file before adding principal key
- * information.
- *
- * The caller must have an EXCLUSIVE LOCK on the files before calling this function.
+ * In the backend, the caller must hold an exclusive tde_lwlock_enc_keys, and
+ * the key gets into the principal key cache along with the file.
  *
  * write_xlog: if true, the function will write an XLOG record about the
  * principal key addition. We may want to skip this during server recovery/startup
@@ -984,46 +1023,47 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XL
 void
 pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 {
-	int			fd;
-	off_t		curr_pos = 0;
-	TDESignedPrincipalKeyInfo signed_key_Info;
+	TDESignedPrincipalKeyInfo signed_key_info;
+	char		tmp_path[MAXPGPATH];
+	XLogRecPtr	lsn = InvalidXLogRecPtr;
 
-	pg_tde_sign_principal_key_info(&signed_key_Info, principal_key);
+	pg_tde_sign_principal_key_info(&signed_key_info, principal_key);
+
+#ifndef FRONTEND
+	if (write_xlog)
+		lsn = pg_tde_key_change_lsn();
+#endif
+
+	pg_tde_write_wal_key_file_aside(&signed_key_info, lsn, tmp_path);
 
 #ifndef FRONTEND
 	if (write_xlog)
 	{
-		char		tmp_path[MAXPGPATH];
-
-		/*
-		 * Write the file aside first. So everything that may fail is done
-		 * before the record is written, and only the rename is left for the
-		 * critical section.
-		 */
-		snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
-
-		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-		fd = pg_tde_open_wal_key_file_write(tmp_path, &signed_key_Info, pg_tde_key_change_lsn(), true, &curr_pos);
-		CloseTransientFile(fd);
-		LWLockRelease(tde_lwlock_wal_keys());
-
 		PG_TDE_START_XLOG_CHANGE(XLOG_TDE_ADD_PRINCIPAL_KEY,
-								 &signed_key_Info, sizeof(TDESignedPrincipalKeyInfo));
+								 &signed_key_info, sizeof(TDESignedPrincipalKeyInfo));
 		{
-			/* The lock is taken only here, as it must not be held while writing WAL */
-			LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-			durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
-			LWLockRelease(tde_lwlock_wal_keys());
+			/*
+			 * The lock is taken only here, as it must not be held while
+			 * writing WAL
+			 */
+			pg_tde_replace_wal_key_file(tmp_path);
 		}
 		PG_TDE_END_XLOG_CHANGE();
-
-		return;
 	}
+	else
+#endif
+		pg_tde_replace_wal_key_file(tmp_path);
+
+#ifndef FRONTEND
+
+	/*
+	 * The key gets into the cache along with the file, hence under the same
+	 * lock. But out of the critical section, as the cache may allocate
+	 * memory.
+	 */
+	pg_tde_set_server_key_cache(principal_key);
 #endif
 
-	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, InvalidXLogRecPtr, true, &curr_pos);
-	CloseTransientFile(fd);
 	LWLockRelease(tde_lwlock_wal_keys());
 }
 
