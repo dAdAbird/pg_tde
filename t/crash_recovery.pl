@@ -237,6 +237,34 @@ $stdout =
   $node->safe_psql('empty', 'SELECT key_name FROM pg_tde_key_info();');
 is($stdout, 'empty_key_2', 'database uses the key that was set last');
 
+# The start location of a WAL key is set by the first WAL write that uses it.
+# After a clean restart, that is the write of the record of the server key
+# rotation, which happens while the WAL keys file is being replaced with its
+# re-encrypted copy. Check that the location gets into the new file. Otherwise,
+# the WAL written with this key can't be read after the crash.
+$node->safe_psql('postgres',
+	"SELECT pg_tde_create_key_using_global_key_provider('wal_encryption_key_3', 'global_keyring');"
+);
+$node->restart;
+
+$node->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_set_server_key_using_global_key_provider('wal_encryption_key_3', 'global_keyring');
+	INSERT INTO test_enc (x) VALUES (9), (10);
+));
+
+$node->kill9;
+
+PGTDE::poll_start($node);
+
+$stdout = $node->safe_psql('postgres', 'TABLE test_enc;');
+is($stdout, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10",
+	'can read data after the server key rotation right after the restart');
+
+$stdout = $node->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, 'wal_encryption_key_3', 'server key is the one it was rotated to');
+
 $node->stop;
 
 done_testing();

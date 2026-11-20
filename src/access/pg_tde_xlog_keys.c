@@ -761,7 +761,54 @@ pg_tde_initialize_wal_key_file_entry(WalKeyFileEntry *entry,
 
 #ifndef FRONTEND
 /*
+ * Brings the copy of the WAL keys file up to date with the changes that
+ * pg_tde_wal_last_range_set_location() might have made in the file since it
+ * was copied. That function is the only one that changes the file without
+ * tde_lwlock_enc_keys, and it touches nothing but the start location of the
+ * last range and the type of the one before it.
+ *
+ * Both files must have the same entries, and the caller must hold an exclusive
+ * tde_lwlock_wal_keys.
+ */
+static void
+pg_tde_sync_last_wal_ranges(int src_fd, int dst_fd, const char *dst_path)
+{
+	int			last_idx;
+
+	Assert(LWLockHeldByMeInMode(tde_lwlock_wal_keys(), LW_EXCLUSIVE));
+
+	last_idx = ((lseek(src_fd, 0, SEEK_END) - sizeof(WalKeyFileHeader)) / sizeof(WalKeyFileEntry)) - 1;
+
+	for (int idx = last_idx; idx >= 0 && idx >= last_idx - 1; idx--)
+	{
+		off_t		pos = sizeof(WalKeyFileHeader) + idx * sizeof(WalKeyFileEntry);
+		WalKeyFileEntry src_entry;
+		WalKeyFileEntry dst_entry;
+
+		if (pg_pread(src_fd, &src_entry, sizeof(WalKeyFileEntry), pos) != sizeof(WalKeyFileEntry) ||
+			pg_pread(dst_fd, &dst_entry, sizeof(WalKeyFileEntry), pos) != sizeof(WalKeyFileEntry))
+			ereport(ERROR,
+					errcode_for_file_access(),
+					errmsg("could not read WAL key at index %d: %m", idx));
+
+		if (src_entry.range_type == dst_entry.range_type &&
+			wal_location_cmp(src_entry.range_start, dst_entry.range_start) == 0)
+			continue;
+
+		dst_entry.range_type = src_entry.range_type;
+		dst_entry.range_start = src_entry.range_start;
+
+		/* Syncs the file as well */
+		pg_tde_write_one_wal_key_file_entry(dst_fd, &dst_entry, &pos, dst_path);
+	}
+}
+
+/*
  * Rotate keys and generates the WAL record for it.
+ *
+ * The WAL keys are re-encrypted into a new file which then replaces the
+ * current one. If write_xlog is true, the record is flushed before that, see
+ * PG_TDE_START_XLOG_CHANGE().
  *
  * redo_lsn: start of the record being replayed if write_xlog is false.
  */
@@ -788,10 +835,7 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 
 	snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
 
-	/*
-	 * Keeps the WAL callbacks away from the file while we are replacing it.
-	 * Must be released before writing WAL.
-	 */
+	/* Keeps the WAL callbacks away from the file while we are copying it */
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
 	old_fd = pg_tde_open_wal_key_file_read(get_wal_key_file_path(), false, &old_curr_pos);
@@ -814,34 +858,9 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 		pfree(range);
 	}
 
-	CloseTransientFile(old_fd);
-	CloseTransientFile(new_fd);
-
 	/*
 	 * Do the final step - replace the current WAL key file with the file with
 	 * new data.
-	 */
-	durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
-
-	/*
-	 * The cache must be switched to the new key along with the file.
-	 * principal_key may point to the cache entry, so it must not be used
-	 * after this.
-	 */
-	pg_tde_set_server_key_cache(new_principal_key);
-
-	LWLockRelease(tde_lwlock_wal_keys());
-
-	/*
-	 * We do WAL writes past the event ("the write behind logging") rather
-	 * than before ("the write ahead") because we need logging here only for
-	 * replication purposes. The rotation results in data written and fsynced
-	 * to disk. Which in most cases would happen way before it's written to
-	 * the WAL disk file. As WAL will be flushed at the end of the
-	 * transaction, on its commit, hence after this function returns (there is
-	 * also a bg writer, but the commit is what is guaranteed). And it makes
-	 * sense to replicate the event only after its effect has been
-	 * successfully applied to the source.
 	 */
 	if (write_xlog)
 	{
@@ -851,10 +870,42 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 		xlrec.keyringId = new_principal_key->keyInfo.keyringId;
 		memcpy(xlrec.keyName, new_principal_key->keyInfo.name, sizeof(new_principal_key->keyInfo.name));
 
-		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(XLogPrincipalKeyRotate));
-		XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ROTATE_PRINCIPAL_KEY);
+		/*
+		 * The lock must not be held while writing WAL. But once it is
+		 * released, the WAL write callback may set the start location of the
+		 * last range in the file we have just copied. And it does so if the
+		 * record below happens to be the first WAL written since the server
+		 * start. So the lock is taken back only for the replacement itself,
+		 * and the copy is brought up to date before that.
+		 */
+		LWLockRelease(tde_lwlock_wal_keys());
+
+		PG_TDE_START_XLOG_CHANGE(XLOG_TDE_ROTATE_PRINCIPAL_KEY,
+								 &xlrec, sizeof(XLogPrincipalKeyRotate));
+		{
+			LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+			pg_tde_sync_last_wal_ranges(old_fd, new_fd, tmp_path);
+			durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
+		}
+		PG_TDE_END_XLOG_CHANGE();
 	}
+	else
+	{
+		durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
+	}
+
+	/*
+	 * The cache must be switched to the new key along with the file, hence
+	 * under the same lock. But out of the critical section, as the cache may
+	 * allocate memory. principal_key may point to the cache entry, so it must
+	 * not be used after this.
+	 */
+	pg_tde_set_server_key_cache(new_principal_key);
+
+	LWLockRelease(tde_lwlock_wal_keys());
+
+	CloseTransientFile(old_fd);
+	CloseTransientFile(new_fd);
 }
 #endif
 
