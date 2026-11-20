@@ -352,7 +352,7 @@ set_principal_key_with_keyring(const char *key_name,
 		if (dbOid == GLOBAL_DATA_TDE_OID)
 		{
 			/* Updates the cache as well */
-			pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, true);
+			pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, true, InvalidXLogRecPtr);
 		}
 		else
 		{
@@ -386,7 +386,9 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec, XLogRecPtr lsn)
 
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
 
-	if (pg_tde_principal_key_is_newer(xlrec->databaseId, lsn))
+	if (xlrec->databaseId == GLOBAL_DATA_TDE_OID ?
+		pg_tde_server_key_is_newer(lsn) :
+		pg_tde_principal_key_is_newer(xlrec->databaseId, lsn))
 	{
 		ereport(LOG,
 				errmsg("skipping rotation of principal key of database %u to \"%s\"",
@@ -457,8 +459,13 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec, XLogRecPtr lsn)
 
 	if (xlrec->databaseId == GLOBAL_DATA_TDE_OID)
 	{
-		/* Updates the cache as well */
-		pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, false);
+		/*
+		 * There is nothing to do if it is the server key already, e.g. the
+		 * record is replayed once again. Otherwise, updates the cache as
+		 * well.
+		 */
+		if (!pg_tde_is_same_principal_key(curr_principal_key, new_principal_key))
+			pg_tde_perform_rotate_server_key(curr_principal_key, new_principal_key, false, lsn);
 	}
 	else
 	{
@@ -491,7 +498,7 @@ xl_tde_perform_delete_key(Oid dbOid, XLogRecPtr lsn)
 		 * The server key is kept in the WAL keys file rather than in a file
 		 * of its own. Its cache entry is removed along with that file.
 		 */
-		pg_tde_delete_server_key_redo();
+		pg_tde_delete_server_key_redo(lsn);
 	}
 	else if (pg_tde_principal_key_is_newer(dbOid, lsn))
 	{
@@ -1646,7 +1653,7 @@ pg_tde_rotate_default_key_for_database(TDEPrincipalKey *oldKey, TDEPrincipalKey 
 	if (newKey->keyInfo.databaseId == GLOBAL_DATA_TDE_OID)
 	{
 		/* Updates the cache as well */
-		pg_tde_perform_rotate_server_key(oldKey, newKey, true);
+		pg_tde_perform_rotate_server_key(oldKey, newKey, true, InvalidXLogRecPtr);
 	}
 	else
 	{

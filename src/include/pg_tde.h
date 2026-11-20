@@ -14,7 +14,7 @@
  * Only numeric version (the most left byte) should be changed when updating
  * file format. Otherwise, it will break the migration process.
  */
-#define PG_TDE_WAL_KEY_FILE_MAGIC 0x024B4557	/* version ID value = WEK 02 */
+#define PG_TDE_WAL_KEY_FILE_MAGIC 0x034B4557	/* version ID value = WEK 03 */
 #define PG_TDE_SMGR_FILE_MAGIC		  0x05454454	/* version ID value = TDE
 													 * 04 */
 

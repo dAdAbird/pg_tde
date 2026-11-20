@@ -54,7 +54,7 @@ tdeheap_rmgr_redo(XLogReaderState *record)
 		TDESignedPrincipalKeyInfo *mkey = (TDESignedPrincipalKeyInfo *) XLogRecGetData(record);
 
 		if (mkey->data.databaseId == GLOBAL_DATA_TDE_OID)
-			pg_tde_save_server_key_redo(mkey);
+			pg_tde_save_server_key_redo(mkey, record->ReadRecPtr);
 		else
 			pg_tde_save_principal_key_redo(mkey, record->ReadRecPtr);
 	}

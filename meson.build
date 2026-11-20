@@ -356,6 +356,7 @@ tap_tests = [
   't/key_rotate_backup.pl',
   't/key_rotate_tablespace.pl',
   't/keys_update.pl',
+  't/keys_update_wal.pl',
   't/key_validation.pl',
   't/kmip.pl',
   't/pg_basebackup.pl',

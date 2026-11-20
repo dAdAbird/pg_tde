@@ -85,6 +85,60 @@ $stdout = $replica->safe_psql('postgres',
 	'SELECT key_name FROM pg_tde_server_key_info();');
 is($stdout, '', 'the replica has no server key after its deletion');
 
+# check that the replica having WAL keys of its own keeps the deleted server
+# key they are encrypted with, and switches to the next one set on the primary
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_add_global_key_provider_file('tmp-vault', '$keydir/tmp.key');
+	SELECT pg_tde_set_default_key_using_global_key_provider('tmp-default-key', 'tmp-vault');
+));
+$primary->wait_for_catchup('replica');
+
+$replica->append_conf('postgresql.conf', "pg_tde.wal_encrypt = on");
+$replica->restart;
+
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_create_key_using_global_key_provider('tmp-default-key-2', 'tmp-vault');
+	-- Rotates the server key as well
+	SELECT pg_tde_set_default_key_using_global_key_provider('tmp-default-key-2', 'tmp-vault');
+	SELECT pg_tde_delete_default_key();
+));
+$primary->wait_for_catchup('replica');
+
+$stdout = $replica->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, 'tmp-default-key-2',
+	'the replica keeps the server key its WAL keys are encrypted with');
+
+$primary->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_create_key_using_global_key_provider('tmp-server-key', 'tmp-vault');
+	SELECT pg_tde_set_server_key_using_global_key_provider('tmp-server-key', 'tmp-vault');
+));
+$primary->wait_for_catchup('replica');
+
+$stdout = $replica->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, 'tmp-server-key',
+	'the replica switches to the server key set on the primary');
+
+# The replica has to decrypt its WAL keys with the new server key on start.
+# It also replays the rotation and the deletion of the server key once again,
+# which must not bring the old key back.
+$replica->append_conf('postgresql.conf', "pg_tde.wal_encrypt = off");
+$replica->restart;
+$primary->wait_for_catchup('replica');
+
+$stdout =
+  $replica->safe_psql('postgres', 'SELECT * FROM test_enc ORDER BY x;');
+is($stdout, "1\n2", 'can read from test_enc after the replica restart');
+
+$stdout = $replica->safe_psql('postgres',
+	'SELECT key_name FROM pg_tde_server_key_info();');
+is($stdout, 'tmp-server-key',
+	'the replica still has the new server key after the restart');
+
 # check primary crash with WAL encryption
 #
 # TODO: This does not seem to actually test WAL encryption

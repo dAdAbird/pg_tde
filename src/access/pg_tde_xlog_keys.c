@@ -29,6 +29,16 @@ typedef struct WalKeyFileHeader
 {
 	int32		file_version;
 	TDESignedPrincipalKeyInfo signed_key_info;
+
+	/*
+	 * WAL position the server key was set at. All the WAL records that
+	 * changed the server key earlier start before it, and the record of
+	 * setting this key doesn't. The file is not brought back to the state it
+	 * had at the redo start, so that is how redo tells the records the file is
+	 * already newer than. InvalidXLogRecPtr if the key was set without a WAL
+	 * record.
+	 */
+	XLogRecPtr	lsn;
 } WalKeyFileHeader;
 
 typedef struct WalKeyFileEntry
@@ -61,11 +71,12 @@ static WalEncryptionRange *pg_tde_wal_range_from_entry(const TDEPrincipalKey *pr
 static void pg_tde_initialize_wal_key_file_entry(WalKeyFileEntry *entry, const TDEPrincipalKey *principal_key, const WalEncryptionRange *range);
 static int	pg_tde_open_wal_key_file_basic(const char *filename, int flags, bool ignore_missing);
 static int	pg_tde_open_wal_key_file_read(const char *filename, bool ignore_missing, off_t *curr_pos);
-static int	pg_tde_open_wal_key_file_write(const char *filename, const TDESignedPrincipalKeyInfo *signed_key_info, bool truncate, off_t *curr_pos);
+static int	pg_tde_open_wal_key_file_write(const char *filename, const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn, bool truncate, off_t *curr_pos);
 static bool pg_tde_read_one_wal_key_file_entry(int fd, WalKeyFileEntry *entry, off_t *offset);
 static void pg_tde_read_one_wal_key_file_entry2(int fd, int32 key_index, WalKeyFileEntry *entry);
 static void pg_tde_wal_key_file_header_read(const char *filename, int fd, WalKeyFileHeader *fheader, off_t *bytes_read);
-static int	pg_tde_wal_key_file_header_write(const char *filename, int fd, const TDESignedPrincipalKeyInfo *signed_key_info, off_t *bytes_written);
+static bool pg_tde_read_wal_key_file_header(WalKeyFileHeader *fheader);
+static int	pg_tde_wal_key_file_header_write(const char *filename, int fd, const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn, off_t *bytes_written);
 static void pg_tde_write_one_wal_key_file_entry(int fd, const WalKeyFileEntry *entry, off_t *offset, const char *db_map_path);
 static void pg_tde_write_wal_key_file_entry(const WalEncryptionRange *range, const TDEPrincipalKey *principal_key);
 
@@ -103,7 +114,7 @@ pg_tde_wal_last_range_set_location(WalLocation loc)
 
 	LWLockAcquire(lock_pk, LW_EXCLUSIVE);
 
-	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), NULL, false, &read_pos);
+	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), NULL, InvalidXLogRecPtr, false, &read_pos);
 
 	last_key_idx = ((lseek(fd, 0, SEEK_END) - sizeof(WalKeyFileHeader)) / sizeof(WalKeyFileEntry)) - 1;
 	write_pos = sizeof(WalKeyFileHeader) +
@@ -474,6 +485,7 @@ pg_tde_open_wal_key_file_read(const char *filename,
 static int
 pg_tde_open_wal_key_file_write(const char *filename,
 							   const TDESignedPrincipalKeyInfo *signed_key_info,
+							   XLogRecPtr lsn,
 							   bool truncate,
 							   off_t *curr_pos)
 {
@@ -495,7 +507,7 @@ pg_tde_open_wal_key_file_write(const char *filename,
 
 	/* In case it's a new file, let's add the header now. */
 	if (bytes_read == 0 && signed_key_info)
-		pg_tde_wal_key_file_header_write(filename, fd, signed_key_info, &bytes_written);
+		pg_tde_wal_key_file_header_write(filename, fd, signed_key_info, lsn, &bytes_written);
 
 	*curr_pos = bytes_read + bytes_written;
 	return fd;
@@ -523,18 +535,51 @@ pg_tde_wal_key_file_header_read(const char *filename,
 	}
 }
 
+/*
+ * Reads the header of the WAL keys file. Returns false if there is no file,
+ * or it is empty.
+ */
+static bool
+pg_tde_read_wal_key_file_header(WalKeyFileHeader *fheader)
+{
+	int			fd;
+	off_t		bytes_read = 0;
+
+	fd = pg_tde_open_wal_key_file_basic(get_wal_key_file_path(), O_RDONLY | PG_BINARY, true);
+
+	/* The file does not exist. */
+	if (fd < 0)
+		return false;
+
+	pg_tde_wal_key_file_header_read(get_wal_key_file_path(), fd, fheader, &bytes_read);
+	if (bytes_read > 0 &&
+		FILEMAGIC_TYPE(fheader->file_version) != FILEMAGIC_TYPE(PG_TDE_WAL_KEY_FILE_MAGIC))
+	{
+		ereport(FATAL,
+				errcode_for_file_access(),
+				errmsg("WAL key file \"%s\" is corrupted or has wrong version: %m", get_wal_key_file_path()),
+				errdetail("Getting principal key from the file."));
+	}
+
+	CloseTransientFile(fd);
+
+	return bytes_read > 0;
+}
+
 static int
 pg_tde_wal_key_file_header_write(const char *filename,
 								 int fd,
 								 const TDESignedPrincipalKeyInfo *signed_key_info,
+								 XLogRecPtr lsn,
 								 off_t *bytes_written)
 {
-	WalKeyFileHeader fheader;
+	WalKeyFileHeader fheader = {0};
 
 	Assert(signed_key_info);
 
 	fheader.file_version = PG_TDE_WAL_KEY_FILE_MAGIC;
 	fheader.signed_key_info = *signed_key_info;
+	fheader.lsn = lsn;
 	*bytes_written = pg_pwrite(fd, &fheader, sizeof(WalKeyFileHeader), 0);
 
 	if (*bytes_written != sizeof(WalKeyFileHeader))
@@ -610,7 +655,7 @@ pg_tde_write_wal_key_file_entry(const WalEncryptionRange *range,
 	pg_tde_sign_principal_key_info(&signed_key_Info, principal_key);
 
 	/* Open and validate file for basic correctness. */
-	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, false, &curr_pos);
+	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, InvalidXLogRecPtr, false, &curr_pos);
 
 	/* WAL keys are always added at the end of the file */
 	curr_pos = lseek(fd, 0, SEEK_END);
@@ -717,11 +762,14 @@ pg_tde_initialize_wal_key_file_entry(WalKeyFileEntry *entry,
 #ifndef FRONTEND
 /*
  * Rotate keys and generates the WAL record for it.
+ *
+ * redo_lsn: start of the record being replayed if write_xlog is false.
  */
 void
 pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 								 const TDEPrincipalKey *new_principal_key,
-								 bool write_xlog)
+								 bool write_xlog,
+								 XLogRecPtr redo_lsn)
 {
 	TDESignedPrincipalKeyInfo new_signed_key_info;
 	off_t		old_curr_pos,
@@ -729,12 +777,14 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 	int			old_fd,
 				new_fd;
 	char		tmp_path[MAXPGPATH];
+	XLogRecPtr	lsn;
 
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 	Assert(principal_key);
 	Assert(principal_key->keyInfo.databaseId == GLOBAL_DATA_TDE_OID);
 
 	pg_tde_sign_principal_key_info(&new_signed_key_info, new_principal_key);
+	lsn = write_xlog ? pg_tde_key_change_lsn() : redo_lsn;
 
 	snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
 
@@ -745,7 +795,7 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
 	old_fd = pg_tde_open_wal_key_file_read(get_wal_key_file_path(), false, &old_curr_pos);
-	new_fd = pg_tde_open_wal_key_file_write(tmp_path, &new_signed_key_info, true, &new_curr_pos);
+	new_fd = pg_tde_open_wal_key_file_write(tmp_path, &new_signed_key_info, lsn, true, &new_curr_pos);
 
 	/* Read all entries until EOF */
 	while (1)
@@ -809,19 +859,68 @@ pg_tde_perform_rotate_server_key(const TDEPrincipalKey *principal_key,
 #endif
 
 #ifndef FRONTEND
+/*
+ * Redo of setting the server key.
+ *
+ * The primary writes this record only when it has no server key, so normally
+ * there is none here either and the key is just saved.
+ *
+ * If there is one, it is either the very same key, when the record is
+ * replayed once again, or the key that this server kept on its own. E.g. it
+ * was deleted on the primary, but kept here by pg_tde_delete_server_key_redo()
+ * because of the WAL keys encrypted with it. The record sets its successor
+ * then, and the WAL keys are re-encrypted with it. Like redo of a rotation,
+ * this needs both keys to be available in their key providers.
+ *
+ * Nothing is done if the file is newer than the record, as tells the WAL
+ * position kept in it.
+ *
+ * lsn: start of the record being replayed.
+ */
 void
-pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info)
+pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info, XLogRecPtr lsn)
 {
-	int			fd;
-	off_t		curr_pos;
+	TDESignedPrincipalKeyInfo *curr_key_info;
 
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
-	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
-	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), signed_key_info, false, &curr_pos);
-	CloseTransientFile(fd);
+	if (pg_tde_server_key_is_newer(lsn))
+	{
+		LWLockRelease(tde_lwlock_enc_keys());
+		return;
+	}
 
-	LWLockRelease(tde_lwlock_wal_keys());
+	curr_key_info = pg_tde_get_server_key_info();
+
+	if (curr_key_info == NULL)
+	{
+		int			fd;
+		off_t		curr_pos;
+
+		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+		fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), signed_key_info, lsn, false, &curr_pos);
+		CloseTransientFile(fd);
+		LWLockRelease(tde_lwlock_wal_keys());
+	}
+	else if (curr_key_info->data.keyringId != signed_key_info->data.keyringId ||
+			 strncmp(curr_key_info->data.name, signed_key_info->data.name, PRINCIPAL_KEY_NAME_LEN) != 0)
+	{
+		TDEPrincipalKey *curr_key;
+		TDEPrincipalKey *new_key;
+
+		curr_key = GetPrincipalKey(GLOBAL_DATA_TDE_OID, LW_EXCLUSIVE);
+		new_key = pg_tde_load_principal_key(signed_key_info);
+
+		/* Updates the cache as well */
+		pg_tde_perform_rotate_server_key(curr_key, new_key, false, lsn);
+
+		explicit_bzero(new_key, sizeof(TDEPrincipalKey));
+		pfree(new_key);
+	}
+
+	if (curr_key_info != NULL)
+		pfree(curr_key_info);
+
 	LWLockRelease(tde_lwlock_enc_keys());
 }
 #endif
@@ -861,7 +960,7 @@ pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 		snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
 
 		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-		fd = pg_tde_open_wal_key_file_write(tmp_path, &signed_key_Info, true, &curr_pos);
+		fd = pg_tde_open_wal_key_file_write(tmp_path, &signed_key_Info, pg_tde_key_change_lsn(), true, &curr_pos);
 		CloseTransientFile(fd);
 		LWLockRelease(tde_lwlock_wal_keys());
 
@@ -880,7 +979,7 @@ pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 #endif
 
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, true, &curr_pos);
+	fd = pg_tde_open_wal_key_file_write(get_wal_key_file_path(), &signed_key_Info, InvalidXLogRecPtr, true, &curr_pos);
 	CloseTransientFile(fd);
 	LWLockRelease(tde_lwlock_wal_keys());
 }
@@ -892,44 +991,29 @@ pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 TDESignedPrincipalKeyInfo *
 pg_tde_get_server_key_info(void)
 {
-	int			fd;
 	WalKeyFileHeader fheader;
-	TDESignedPrincipalKeyInfo *signed_key_info = NULL;
-	off_t		bytes_read = 0;
+	TDESignedPrincipalKeyInfo *signed_key_info;
 
-	/*
-	 * Ensuring that we always open the file in binary mode. The caller must
-	 * specify other flags for reading, writing or creating the file.
-	 */
-	fd = pg_tde_open_wal_key_file_basic(get_wal_key_file_path(), O_RDONLY, true);
-
-	/* The file does not exist. */
-	if (fd < 0)
+	if (!pg_tde_read_wal_key_file_header(&fheader))
 		return NULL;
 
-	pg_tde_wal_key_file_header_read(get_wal_key_file_path(), fd, &fheader, &bytes_read);
-	if (bytes_read > 0 &&
-		FILEMAGIC_TYPE(fheader.file_version) != FILEMAGIC_TYPE(PG_TDE_WAL_KEY_FILE_MAGIC))
-	{
-		ereport(FATAL,
-				errcode_for_file_access(),
-				errmsg("WAL key file \"%s\" is corrupted or has wrong version: %m", get_wal_key_file_path()),
-				errdetail("Getting principal key from the file."));
-	}
-
-	CloseTransientFile(fd);
-
-	/*
-	 * It's not a new file. So we can copy the principal key info from the
-	 * header
-	 */
-	if (bytes_read > 0)
-	{
-		signed_key_info = palloc_object(TDESignedPrincipalKeyInfo);
-		*signed_key_info = fheader.signed_key_info;
-	}
+	signed_key_info = palloc_object(TDESignedPrincipalKeyInfo);
+	*signed_key_info = fheader.signed_key_info;
 
 	return signed_key_info;
+}
+
+/*
+ * Checks if the server key was set later than the WAL record starting at the
+ * given position was written. If so, redo must leave the key alone, see
+ * pg_tde_principal_key_is_newer().
+ */
+bool
+pg_tde_server_key_is_newer(XLogRecPtr lsn)
+{
+	WalKeyFileHeader fheader;
+
+	return pg_tde_read_wal_key_file_header(&fheader) && fheader.lsn > lsn;
 }
 
 int
@@ -988,14 +1072,23 @@ pg_tde_delete_server_key(void)
  *
  * WAL keys are not replicated, every server has its own. So unlike the
  * primary at the time of the deletion, we may have some: a standby can have
- * WAL encryption enabled on its own, and during a crash recovery the file may
- * be newer than the record being replayed. Removing the file would make WAL
+ * WAL encryption enabled on its own. Removing the file would make WAL
  * encrypted with these keys unreadable, hence the server key is kept then.
+ * It is replaced when the primary sets the next server key, see
+ * pg_tde_save_server_key_redo().
+ *
+ * Nothing is done if the file is newer than the record, as tells the WAL
+ * position kept in it.
+ *
+ * lsn: start of the record being replayed.
  */
 void
-pg_tde_delete_server_key_redo(void)
+pg_tde_delete_server_key_redo(XLogRecPtr lsn)
 {
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
+
+	if (pg_tde_server_key_is_newer(lsn))
+		return;
 
 	if (pg_tde_count_wal_ranges_in_file() != 0)
 	{
@@ -1007,7 +1100,7 @@ pg_tde_delete_server_key_redo(void)
 
 	/*
 	 * Remove whole key map file, and the key from the cache along with it.
-	 * The file is gone already when it is newer than the record.
+	 * The file may be gone already, if the record is replayed once again.
 	 */
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 	if (access(get_wal_key_file_path(), F_OK) == 0 || errno != ENOENT)
@@ -1027,6 +1120,13 @@ pg_tde_delete_server_key_redo(void)
  * WalKeyFileEntry (current version)
  */
 typedef bool (*WalEntryFromDiskEntry) (int fd, off_t *entry_offset, const TDEPrincipalKey *principal_key, WalKeyFileEntry *out);
+
+/* File header of the versions 1 and 2 */
+typedef struct WalKeyFileHeaderV1
+{
+	int32		file_version;
+	TDESignedPrincipalKeyInfo signed_key_info;
+} WalKeyFileHeaderV1;
 
 typedef struct WalKeyFileEntryV1
 {
@@ -1103,18 +1203,24 @@ range_from_disk_entry_v1(int fd, off_t *entry_offset, const TDEPrincipalKey *pri
 	return true;
 }
 
+/* The entries have not changed since the version 2 */
+static bool
+range_from_disk_entry_v2(int fd, off_t *entry_offset, const TDEPrincipalKey *principal_key, WalKeyFileEntry *out)
+{
+	return pg_tde_read_one_wal_key_file_entry(fd, out, entry_offset);
+}
+
 void
 pg_tde_update_wal_keys_file(void)
 {
 	LWLock	   *lock_pk = tde_lwlock_enc_keys();
-	TDEPrincipalKey *principal_key;
-	TDESignedPrincipalKeyInfo signed_key_info;
+	TDEPrincipalKey *principal_key = NULL;
 	char		tmp_wal_key_file_path[MAXPGPATH] = {0};
 	off_t		read_pos,
 				write_pos;
 	int			old_fd,
 				new_fd;
-	WalKeyFileHeader fheader;
+	WalKeyFileHeaderV1 fheader;
 	WalEntryFromDiskEntry read_range;
 	WalKeyFileEntry new_entry;
 
@@ -1124,43 +1230,55 @@ pg_tde_update_wal_keys_file(void)
 		return;
 
 	snprintf(tmp_wal_key_file_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
-	pg_tde_wal_key_file_header_read(get_wal_key_file_path(), old_fd, &fheader, &read_pos);
 
-	/* check if we have anything to do */
-	if (fheader.file_version == PG_TDE_WAL_KEY_FILE_MAGIC)
+	/*
+	 * The header of the current version is longer, but an up-to-date file is
+	 * told by the version, which comes first in all of them.
+	 */
+	read_pos = pg_pread(old_fd, &fheader, sizeof(WalKeyFileHeaderV1), 0);
+
+	/* check if we have anything to do: an empty file is the same as none */
+	if (read_pos == 0 ||
+		(read_pos >= sizeof(int32) && fheader.file_version == PG_TDE_WAL_KEY_FILE_MAGIC))
 	{
 		CloseTransientFile(old_fd);
 		return;
 	}
 
-	/* The type check later, when extracting the principal key */
+	if (read_pos != sizeof(WalKeyFileHeaderV1) ||
+		FILEMAGIC_TYPE(fheader.file_version) != FILEMAGIC_TYPE(PG_TDE_WAL_KEY_FILE_MAGIC))
+		ereport(FATAL,
+				errcode(ERRCODE_DATA_CORRUPTED),
+				errmsg("WAL key file \"%s\" is corrupted", get_wal_key_file_path()));
+
 	if (FILEMAGIC_VERSION(fheader.file_version) == 1)
 		read_range = range_from_disk_entry_v1;
+	else if (FILEMAGIC_VERSION(fheader.file_version) == 2)
+		read_range = range_from_disk_entry_v2;
 	else
 		elog(ERROR, "wal_keys migration: unsupported or corrupted old file version %d", FILEMAGIC_VERSION(fheader.file_version));
 
 	/*
-	 * No real need in lock here as the func should be called only on the
-	 * server start, but GetPrincipalKey() expects one.
+	 * No real need in locks here as the func should be called only on the
+	 * server start, but the functions below expect them.
 	 */
 	LWLockAcquire(lock_pk, LW_EXCLUSIVE);
 
 	/*
-	 * The old file exists and it's not empty, hence a principal key should
-	 * exist as well.
+	 * The principal key is needed only to re-encrypt the entries of the
+	 * version 1. It is loaded by the old header, as nothing can read the file
+	 * of an old version but this function.
 	 */
-	principal_key = GetPrincipalKey(GLOBAL_DATA_TDE_OID, LW_EXCLUSIVE);
-	if (principal_key == NULL)
-	{
-		ereport(ERROR,
-				errmsg("could not get server principal key"),
-				errdetail("Failed to updated format of WAL keys."));
-	}
-	pg_tde_sign_principal_key_info(&signed_key_info, principal_key);
+	if (FILEMAGIC_VERSION(fheader.file_version) == 1)
+		principal_key = pg_tde_load_principal_key(&fheader.signed_key_info);
 
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
 
-	new_fd = pg_tde_open_wal_key_file_write(tmp_wal_key_file_path, &signed_key_info, true, &write_pos);
+	/*
+	 * The old versions don't have the WAL position the server key was set
+	 * at, so the file is taken as older than any WAL record.
+	 */
+	new_fd = pg_tde_open_wal_key_file_write(tmp_wal_key_file_path, &fheader.signed_key_info, InvalidXLogRecPtr, true, &write_pos);
 
 	while (read_range(old_fd, &read_pos, principal_key, &new_entry))
 	{
@@ -1173,6 +1291,12 @@ pg_tde_update_wal_keys_file(void)
 
 	LWLockRelease(tde_lwlock_wal_keys());
 	LWLockRelease(lock_pk);
+
+	if (principal_key != NULL)
+	{
+		explicit_bzero(principal_key, sizeof(TDEPrincipalKey));
+		pfree(principal_key);
+	}
 }
 
 #endif
