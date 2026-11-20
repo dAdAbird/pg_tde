@@ -836,7 +836,8 @@ pg_tde_save_server_key_redo(const TDESignedPrincipalKeyInfo *signed_key_info)
  *
  * write_xlog: if true, the function will write an XLOG record about the
  * principal key addition. We may want to skip this during server recovery/startup
- * or in some other cases when WAL writes are not allowed.
+ * or in some other cases when WAL writes are not allowed. The record is
+ * flushed before the file is put in place, see PG_TDE_START_XLOG_CHANGE().
  */
 void
 pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
@@ -850,9 +851,31 @@ pg_tde_save_server_key(const TDEPrincipalKey *principal_key, bool write_xlog)
 #ifndef FRONTEND
 	if (write_xlog)
 	{
-		XLogBeginInsert();
-		XLogRegisterData((char *) &signed_key_Info, sizeof(TDESignedPrincipalKeyInfo));
-		XLogInsert(RM_TDERMGR_ID, XLOG_TDE_ADD_PRINCIPAL_KEY);
+		char		tmp_path[MAXPGPATH];
+
+		/*
+		 * Write the file aside first. So everything that may fail is done
+		 * before the record is written, and only the rename is left for the
+		 * critical section.
+		 */
+		snprintf(tmp_path, MAXPGPATH, "%s.r", get_wal_key_file_path());
+
+		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+		fd = pg_tde_open_wal_key_file_write(tmp_path, &signed_key_Info, true, &curr_pos);
+		CloseTransientFile(fd);
+		LWLockRelease(tde_lwlock_wal_keys());
+
+		PG_TDE_START_XLOG_CHANGE(XLOG_TDE_ADD_PRINCIPAL_KEY,
+								 &signed_key_Info, sizeof(TDESignedPrincipalKeyInfo));
+		{
+			/* The lock is taken only here, as it must not be held while writing WAL */
+			LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+			durable_rename(tmp_path, get_wal_key_file_path(), ERROR);
+			LWLockRelease(tde_lwlock_wal_keys());
+		}
+		PG_TDE_END_XLOG_CHANGE();
+
+		return;
 	}
 #endif
 
@@ -941,13 +964,21 @@ pg_tde_delete_server_key(void)
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 	Assert(pg_tde_count_wal_ranges_in_file() == 0);
 
-	XLogBeginInsert();
-	XLogRegisterData((char *) &dbOid, sizeof(Oid));
-	XLogInsert(RM_TDERMGR_ID, XLOG_TDE_DELETE_PRINCIPAL_KEY);
+	PG_TDE_START_XLOG_CHANGE(XLOG_TDE_DELETE_PRINCIPAL_KEY, &dbOid, sizeof(Oid));
+	{
+		/*
+		 * Remove whole key map file. The lock is taken only here, as it must
+		 * not be held while writing WAL.
+		 */
+		LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
+		durable_unlink(get_wal_key_file_path(), ERROR);
+	}
+	PG_TDE_END_XLOG_CHANGE();
 
-	/* Remove whole key map file, and the key from the cache along with it */
-	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-	durable_unlink(get_wal_key_file_path(), ERROR);
+	/*
+	 * The key leaves the cache along with the file, hence under the same
+	 * lock. But out of the critical section, as the cache may allocate memory.
+	 */
 	pg_tde_set_server_key_cache(NULL);
 	LWLockRelease(tde_lwlock_wal_keys());
 }
