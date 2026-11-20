@@ -935,7 +935,9 @@ pg_tde_delete_principal_key_redo(Oid dbOid)
 
 	Assert(LWLockHeldByMeInMode(tde_lwlock_enc_keys(), LW_EXCLUSIVE));
 
-	if (pg_tde_set_pkey_file_path(dbOid, pkey_path))
+	/* The file is gone already when it is newer than the record */
+	if (pg_tde_set_pkey_file_path(dbOid, pkey_path) &&
+		(access(pkey_path, F_OK) == 0 || errno != ENOENT))
 		durable_unlink(pkey_path, WARNING);
 }
 

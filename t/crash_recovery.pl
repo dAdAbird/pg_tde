@@ -162,6 +162,52 @@ is($stdout, "1\n2", 'can read data encrypted with the default key');
 $stdout = $node->safe_psql('other', 'SELECT key_name FROM pg_tde_key_info();');
 is($stdout, 'default_key', 'database still uses the default key');
 
+# The key files and the key providers may be newer than the WAL records being
+# replayed. Check redo of a key rotation when the key provider of the new key
+# has been deleted since, and when the principal key has been deleted since.
+$node->safe_psql('postgres', 'CREATE DATABASE empty;');
+$node->safe_psql(
+	'empty', qq(
+	CREATE EXTENSION pg_tde;
+
+	SELECT pg_tde_add_database_key_provider_file('empty_keyring', '$keydir/empty.keys');
+	SELECT pg_tde_create_key_using_database_key_provider('empty_key', 'empty_keyring');
+	SELECT pg_tde_create_key_using_database_key_provider('empty_key_1', 'empty_keyring');
+	SELECT pg_tde_set_key_using_database_key_provider('empty_key', 'empty_keyring');
+));
+$node->safe_psql(
+	'postgres', qq(
+	SELECT pg_tde_add_database_key_provider_file('tmp_keyring', '$keydir/tmp.keys');
+	SELECT pg_tde_create_key_using_database_key_provider('tmp_key', 'tmp_keyring');
+	SELECT pg_tde_create_key_using_database_key_provider('db_key_3', 'db_keyring');
+	CHECKPOINT;
+
+	SELECT pg_tde_set_key_using_database_key_provider('tmp_key', 'tmp_keyring');
+	SELECT pg_tde_set_key_using_database_key_provider('db_key_3', 'db_keyring');
+	SELECT pg_tde_delete_database_key_provider('tmp_keyring');
+));
+$node->safe_psql(
+	'empty', qq(
+	SELECT pg_tde_set_key_using_database_key_provider('empty_key_1', 'empty_keyring');
+	SELECT pg_tde_delete_key();
+));
+
+$node->kill9;
+
+PGTDE::poll_start($node);
+
+$stdout = $node->safe_psql('postgres', 'TABLE test_enc;');
+is($stdout, "1\n2\n3\n4\n5\n6\n7\n8",
+	'can read data after redo of the key rotations');
+
+$stdout =
+  $node->safe_psql('postgres', 'SELECT key_name FROM pg_tde_key_info();');
+is($stdout, 'db_key_3', 'database uses the key it was rotated to last');
+
+$stdout =
+  $node->safe_psql('empty', 'SELECT key_name FROM pg_tde_key_info();');
+is($stdout, '', 'database still has no principal key');
+
 $node->stop;
 
 done_testing();

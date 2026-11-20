@@ -367,14 +367,38 @@ xl_tde_perform_rotate_key(XLogPrincipalKeyRotate *xlrec)
 	LWLockAcquire(tde_lwlock_enc_keys(), LW_EXCLUSIVE);
 
 	curr_principal_key = GetPrincipalKeyNoDefault(xlrec->databaseId, LW_EXCLUSIVE);
+	new_keyring = GetKeyProviderByID(xlrec->keyringId, xlrec->databaseId);
 
-	/* Should not happen */
-	if (curr_principal_key == NULL)
+	/*
+	 * Neither the key files nor the key providers are brought back to the
+	 * state they had when the record was written, so they may be newer than
+	 * the record. If the principal key was deleted since, there is nothing to
+	 * rotate. And if the key provider of the new key was removed, the key had
+	 * been rotated once again before that, as a key provider can't be removed
+	 * while in use. Either way, there is nothing left of this rotation to
+	 * redo.
+	 */
+	if (curr_principal_key == NULL || new_keyring == NULL)
 	{
-		ereport(ERROR, errmsg("failed to retrieve current principal key for database %u.", xlrec->databaseId));
+		if (curr_principal_key == NULL)
+			ereport(LOG,
+					errmsg("skipping rotation of principal key of database %u to \"%s\"",
+						   xlrec->databaseId, xlrec->keyName),
+					errdetail("The principal key does not exist anymore."));
+		else
+			ereport(LOG,
+					errmsg("skipping rotation of principal key of database %u to \"%s\"",
+						   xlrec->databaseId, xlrec->keyName),
+					errdetail("Key provider with ID %d does not exist anymore.",
+							  (int) xlrec->keyringId));
+
+		if (new_keyring != NULL)
+			pfree(new_keyring);
+
+		LWLockRelease(tde_lwlock_enc_keys());
+		return;
 	}
 
-	new_keyring = GetKeyProviderByID(xlrec->keyringId, xlrec->databaseId);
 	keyInfo = KeyringGetKey(new_keyring, xlrec->keyName, &return_code);
 
 	if (return_code != KEYRING_CODE_SUCCESS)

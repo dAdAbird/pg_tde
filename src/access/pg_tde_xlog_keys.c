@@ -1005,9 +1005,13 @@ pg_tde_delete_server_key_redo(void)
 		return;
 	}
 
-	/* Remove whole key map file, and the key from the cache along with it */
+	/*
+	 * Remove whole key map file, and the key from the cache along with it.
+	 * The file is gone already when it is newer than the record.
+	 */
 	LWLockAcquire(tde_lwlock_wal_keys(), LW_EXCLUSIVE);
-	durable_unlink(get_wal_key_file_path(), WARNING);
+	if (access(get_wal_key_file_path(), F_OK) == 0 || errno != ENOENT)
+		durable_unlink(get_wal_key_file_path(), WARNING);
 	pg_tde_set_server_key_cache(NULL);
 	LWLockRelease(tde_lwlock_wal_keys());
 }
